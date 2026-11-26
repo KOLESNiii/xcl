@@ -6,7 +6,10 @@ param(
     [Parameter(Mandatory = $true)][string]$OutDir,
     [int]$Seconds = 120,
     [string[]]$CargoFeatures = @(),
-    [string]$CargoTargetDir
+    [string]$CargoTargetDir,
+    # Additional time for launcher work such as shader preparation before the guest timer starts.
+    # An XCL-cold run prepares every shader of the title first, which can take far longer.
+    [ValidateRange(1,86400)][int]$StartupTimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
 
@@ -199,15 +202,15 @@ function Invoke-PerfRun([string]$Mode, [int]$Order) {
     $null = $process.Start()
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
-    $timedOut = -not $process.WaitForExit(($Seconds + 120) * 1000)
+    $timedOut = -not $process.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)
     if ($timedOut -and -not $process.HasExited) { $process.Kill() }
     $process.WaitForExit()
     $watch.Stop()
     $stdout = $stdoutTask.Result
-    $null = $stderrTask.Result
+    $stderr = $stderrTask.Result
 
     $logLine = ($stdout -split '\r?\n' | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
-    if (-not $logLine) { throw "XCL printed no log path during the $Mode run" }
+    if (-not $logLine) { throw "XCL printed no log path during the $Mode run (exit code $($process.ExitCode), timed out: $timedOut); its output:`n$stdout`n$stderr" }
     $log = ($logLine -replace '^Log:\s+', '').Trim()
     if (-not (Test-Path -LiteralPath $log)) { throw "XCL's $Mode log does not exist: $log" }
     Copy-Item -LiteralPath $log -Destination (Join-Path $artifactDir 'xcl.log')
@@ -227,6 +230,7 @@ function Invoke-PerfRun([string]$Mode, [int]$Order) {
         order = $Order
         cache_state = "xcl-$Mode"
         duration_requested_seconds = $Seconds
+        startup_timeout_seconds = $StartupTimeoutSeconds
         duration_actual_ms = $watch.ElapsedMilliseconds
         exit_code = if ($timedOut) { $null } else { $process.ExitCode }
         timed_out = $timedOut

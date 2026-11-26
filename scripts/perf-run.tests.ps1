@@ -78,7 +78,7 @@ exit /b 0
 
     # Redirected like a queued or logged run: Windows PowerShell then turns native stderr (cargo's
     # progress) into error records, which must not stop the script.
-    & (Join-Path $scripts 'perf-run.ps1') -Game $game -OutDir $out -Seconds 2 *> $runLog
+    & (Join-Path $scripts 'perf-run.ps1') -Game $game -OutDir $out -Seconds 2 -StartupTimeoutSeconds 30 *> $runLog
     if ($LASTEXITCODE -ne 0) { throw "perf-run.ps1 exited with $LASTEXITCODE" }
     if (-not (Get-Content -LiteralPath $runLog -Raw).Contains('synthetic build progress')) { throw 'native build output was not kept in the redirected log' }
 
@@ -99,6 +99,7 @@ exit /b 0
         throw 'workload inventory details leaked into the manifest'
     }
     if ($manifest.runs.Count -ne 2 -or $manifest.runs[0].cache_state -ne 'xcl-cold' -or $manifest.runs[1].cache_state -ne 'xcl-warm') { throw 'run records are incomplete' }
+    if (@($manifest.runs | Where-Object { $_.startup_timeout_seconds -ne 30 }).Count -ne 0) { throw 'startup timeout was not recorded' }
     if ((Get-Content -LiteralPath (Join-Path $out 'runs\01-cold\xcl.log') -Raw) -notmatch 'cache=cold') { throw 'cold run did not start with a fresh DXIL cache' }
     if ((Get-Content -LiteralPath (Join-Path $out 'runs\02-warm\xcl.log') -Raw) -notmatch 'cache=warm') { throw 'warm run did not reuse the cold cache' }
     if ((Get-Content -LiteralPath (Join-Path $out 'runs\01-cold\xcl.log') -Raw) -notmatch 'gpu_timing=1 threshold=50') {

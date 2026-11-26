@@ -446,7 +446,9 @@ exact caches warm:
 ```
 
 The script builds `xcl` in release mode and refuses a dirty worktree or a non-empty output
-folder. Both runs use a new temporary `XCL_DATA_ROOT` and `XCL_DXIL_CACHE`; the warm run reuses
+folder. `-Seconds` counts from the title's start; an XCL-cold run first prepares every shader of
+the title, which can take far longer than the default two minutes allowed for startup, so give it
+`-StartupTimeoutSeconds` as `smoke.ps1` takes. Both runs use a new temporary `XCL_DATA_ROOT` and `XCL_DXIL_CACHE`; the warm run reuses
 the cold run's directories. They are deleted afterwards, and existing user caches are never read,
 changed, or deleted. The output folder contains only each run's `xcl.log` and `report.json`, plus
 a versioned `manifest.json` with the commit, run order, hardware/toolchain, selected XCL
