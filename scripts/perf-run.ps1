@@ -80,7 +80,11 @@ function Get-WorkloadIdentity([string]$Path) {
 
 $workloadIdentity = Get-WorkloadIdentity $gamePath
 
+# Native commands run with 'Continue': under Windows PowerShell, when the output is redirected
+# (a queued or logged run), each stderr line becomes an error record that 'Stop' would throw on.
+# Their exit codes are checked instead.
 function Run-Git([string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
     $out = @(& git.exe -C $root @Arguments)
     if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
     return $out
@@ -115,11 +119,14 @@ $cargoArguments += '--target-dir', $cargoTargetPath
 
 Push-Location $root
 try {
+    $ErrorActionPreference = 'Continue'
     & cargo @cargoArguments
-    if ($LASTEXITCODE -ne 0) { throw "release build failed with exit code $LASTEXITCODE" }
+    $buildExit = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = 'Stop'
     Pop-Location
 }
+if ($buildExit -ne 0) { throw "release build failed with exit code $buildExit" }
 if (@(Run-Git -Arguments @('status', '--porcelain', '--untracked-files=all')).Count -ne 0) {
     throw 'the worktree changed during the release build'
 }
@@ -255,8 +262,11 @@ try {
         $os = Get-CimInstance Win32_OperatingSystem
         $windows = "$($os.Caption) $($os.Version) build $($os.BuildNumber)"
     } catch { }
+    $ErrorActionPreference = 'Continue'
     $rust = (& rustc -Vv) -join [Environment]::NewLine
-    if ($LASTEXITCODE -ne 0) { throw 'rustc -Vv failed' }
+    $rustExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($rustExit -ne 0) { throw 'rustc -Vv failed' }
     $verifiedWorkloadIdentity = Get-WorkloadIdentity $gamePath
     if ($verifiedWorkloadIdentity.id -ne $workloadIdentity.id) {
         throw 'game metadata inventory changed during the performance runs'

@@ -15,6 +15,7 @@ $bin = Join-Path $fixture 'bin'
 $userData = Join-Path $fixture 'user-data'
 $userDxil = Join-Path $fixture 'user-dxil'
 $cargoMarker = Join-Path $fixture 'cargo.txt'
+$runLog = Join-Path $fixture 'run.log'
 $mockXcl = Join-Path $bin 'mock-xcl.cmd'
 $oldPath = $env:PATH
 $oldTest = $env:XCL_PERF_RUN_TESTING
@@ -36,6 +37,7 @@ try {
     @'
 @echo off
 echo %* > "%MOCK_CARGO_MARKER%"
+>&2 echo synthetic build progress
 exit /b 0
 '@ | Set-Content -LiteralPath (Join-Path $bin 'cargo.cmd') -Encoding Ascii
     @'
@@ -74,8 +76,11 @@ exit /b 0
     $env:XCL_GPU_TIMING = 'caller-value'
     $env:XCL_GPU_TIMING_MS = '999'
 
-    & (Join-Path $scripts 'perf-run.ps1') -Game $game -OutDir $out -Seconds 2
+    # Redirected like a queued or logged run: Windows PowerShell then turns native stderr (cargo's
+    # progress) into error records, which must not stop the script.
+    & (Join-Path $scripts 'perf-run.ps1') -Game $game -OutDir $out -Seconds 2 *> $runLog
     if ($LASTEXITCODE -ne 0) { throw "perf-run.ps1 exited with $LASTEXITCODE" }
+    if (-not (Get-Content -LiteralPath $runLog -Raw).Contains('synthetic build progress')) { throw 'native build output was not kept in the redirected log' }
 
     $manifest = Get-Content -LiteralPath (Join-Path $out 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     $manifestRaw = Get-Content -LiteralPath (Join-Path $out 'manifest.json') -Raw -Encoding utf8
