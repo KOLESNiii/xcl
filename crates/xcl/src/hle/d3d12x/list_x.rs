@@ -722,6 +722,29 @@ impl ListState {
         }
         self.pending_waits.push(w);
     }
+
+    /// What a `KickoffX` submits along with the list: taken only once its native Close has
+    /// succeeded, so a failed Close leaves them with the recording.
+    fn take_kickoff_effects(&mut self) -> KickoffEffects {
+        let waits = if self.pending_waits.is_empty() {
+            Vec::new()
+        } else {
+            PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
+            std::mem::take(&mut self.pending_waits)
+        };
+        let sparse_writes = self.clear_sparse_writes();
+        let write64_signals = self.clear_write64_signals();
+        self.written_ranges.clear();
+        KickoffEffects { waits, sparse_writes, write64_signals, cpu_writes: std::mem::take(&mut self.cpu_writes) }
+    }
+}
+
+#[derive(Default)]
+struct KickoffEffects {
+    waits: Vec<PendingWait>,
+    sparse_writes: Vec<(usize, usize)>,
+    write64_signals: Vec<(u64, u64)>,
+    cpu_writes: Vec<super::cpu_writes::Write>,
 }
 
 #[derive(Clone, Copy)]
@@ -2625,6 +2648,36 @@ pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, 
     Some(spare as usize)
 }
 
+/// A closed PC list of `wrapper`'s that does not record: an idle spare, or one made on an
+/// allocator of its own (the list's allocator is recording the list itself) and closed at once.
+unsafe fn reserve_closed_list(wrapper: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
+    if let Some(spare) = super::title_list::pop_spare(wrapper) {
+        clear_segment_state(spare as usize);
+        let mut g = LISTS.lock().unwrap();
+        let s = g.get_or_insert_with(HashMap::new).entry(spare as usize).or_default();
+        s.allocator = 0;
+        s.list_type = Some(ty);
+        return Some(spare);
+    }
+    let own: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+    if !real::is_adopted(own.as_raw()) {
+        real::adopt(own.as_raw(), real::Kind::CommandAllocator);
+    }
+    let made = real::create_raw_pc_command_list(dev.as_raw(), ty, own.as_raw() as usize, 0)?;
+    super::alloc_pool::created_on(made as usize, own.as_raw() as usize, ty.0);
+    let ext = *(made as *const usize);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
+    real::preserve_vtable(made, ext);
+    if hr < 0 {
+        on_release(made as usize);
+        pc::<unsafe extern "system" fn(*mut c_void) -> u32>(made, 2)(made);
+        return None;
+    }
+    // (no allocator of the title's: a KickoffX on it does nothing; its own outlives its commands)
+    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(made as usize, ListState { list_type: Some(ty), own_alloc: Some(own), ..Default::default() });
+    Some(made)
+}
+
 /// Deferred mid-list split for `Wait32/64BitValueX` recorded after a `Write64BitValue*` in the
 /// same command list: closes `list` (preserving its earlier `Write64` signals on segment N) and
 /// opens/reuses a sibling PC command list on the same `ID3D12CommandAllocator` as segment N+1,
@@ -3262,10 +3315,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return;
     }
-    let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
-        let mut g = LISTS.lock().unwrap();
-        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
+    let dev = device_of(this);
+    let dev_raw = dev.as_ref().map_or(0, |d| d.as_raw() as usize);
+    let (alloc, queue) = {
+        let g = LISTS.lock().unwrap();
+        let Some(s) = g.as_ref().and_then(|m| m.get(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
                 crate::xlog_info!("D3D12.X: KickoffX – list allocator unknown, deferring to Close + ExecuteCommandLists");
             }
@@ -3283,22 +3337,34 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             }
             return;
         };
-        let active_query = s.occlusion.end_active_early();
-        let waits = if s.pending_waits.is_empty() {
-            Vec::new()
-        } else {
-            PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
-            std::mem::take(&mut s.pending_waits)
+        (s.allocator, q)
+    };
+    // A failed native Close leaves the list unable to Reset: a console list's wrapper then needs
+    // a closed list to go on with. Get it (and the bookkeeping) before anything changes, or
+    // leave the work to the title's Close + ExecuteCommandLists.
+    let wrapper = super::title_list::wrapper_of(this);
+    let standby = match (wrapper, dev.as_ref()) {
+        (None, _) => None,
+        (Some(wrapper), Some(dev)) if super::title_list::prepare_fail_closed(wrapper) => match reserve_closed_list(wrapper, dev, ty) {
+            Some(standby) => Some((wrapper, standby)),
+            None => return warn(&ERR, "KickoffX", format_args!("no closed list to fall back on, deferring to Close + ExecuteCommandLists")),
+        },
+        (Some(_), _) => return warn(&ERR, "KickoffX", format_args!("could not prepare for a failed Close, deferring to Close + ExecuteCommandLists")),
+    };
+    let (bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query) = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
+            drop(g);
+            if let Some((wrapper, standby)) = standby {
+                super::title_list::put_spare(wrapper, standby);
+            }
+            return;
         };
-        let sparse_writes = s.clear_sparse_writes();
-        let write64_signals = s.clear_write64_signals();
-        s.written_ranges.clear();
-        let cpu_writes = std::mem::take(&mut s.cpu_writes);
+        let active_query = s.occlusion.end_active_early();
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
+        (s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query)
     };
-    let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -3314,9 +3380,16 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
     real::preserve_vtable(this, ext);
     if close_hr < 0 {
+        // (the waits, writes and signals stay with the lost recording until the title's Reset)
+        if let Some((wrapper, standby)) = standby {
+            super::title_list::fail_closed(wrapper, this, standby);
+        }
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
-    if let Some(wrapper) = super::title_list::wrapper_of(this) {
+    let KickoffEffects { waits, sparse_writes, write64_signals, cpu_writes } =
+        LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).map(ListState::take_kickoff_effects).unwrap_or_default();
+    if let Some((wrapper, standby)) = standby {
+        super::title_list::put_spare(wrapper, standby);
         record_deferred(wrapper);
     }
 
@@ -7430,6 +7503,114 @@ mod tests {
             console_heap::unregister(co);
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
+        }
+    }
+
+    /// A PC list (or device) for `kickoff_x` without a GPU: `vt` is one past the slot holding
+    /// the PC vtable (`real::orig_fn` reads `vt[-1]`).
+    #[repr(C)]
+    struct KickoffFake {
+        vt: *const usize,
+        refs: u32,
+        resets: u32,
+        dev: usize,
+    }
+
+    unsafe extern "system" fn kf_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *mut KickoffFake)).refs += 1;
+        (*(this as *mut KickoffFake)).refs
+    }
+    unsafe extern "system" fn kf_release(this: *mut c_void) -> u32 {
+        (*(this as *mut KickoffFake)).refs -= 1;
+        (*(this as *mut KickoffFake)).refs
+    }
+    unsafe extern "system" fn kf_get_device(this: *mut c_void, _riid: *const windows::core::GUID, ppv: *mut *mut c_void) -> i32 {
+        let dev = (*(this as *mut KickoffFake)).dev as *mut c_void;
+        kf_add_ref(dev);
+        *ppv = dev;
+        0
+    }
+    unsafe extern "system" fn kf_type(_: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+        D3D12_COMMAND_LIST_TYPE_DIRECT
+    }
+    unsafe extern "system" fn kf_close_out_of_memory(_: *mut c_void) -> i32 {
+        0x8007_000Eu32 as i32
+    }
+    unsafe extern "system" fn kf_reset(this: *mut c_void, _: usize, _: usize) -> i32 {
+        (*(this as *mut KickoffFake)).resets += 1;
+        0
+    }
+
+    /// The native Close of a console list's KickoffX fails (#2787): the waits, Write64 signals
+    /// and CPU writes stay with the lost recording, which is never submitted, reset or reused;
+    /// the wrapper goes on with a closed list, which the title's Reset reopens, and the lost
+    /// recording's effects go with that Reset.
+    #[test]
+    fn kickoff_close_failure_keeps_effects_and_goes_on_with_a_closed_list() {
+        use super::super::title_list;
+        let mut pc_vt = vec![0usize; 16];
+        pc_vt[2] = kf_release as usize;
+        pc_vt[PC_GET_TYPE] = kf_type as usize;
+        pc_vt[PC_CLOSE] = kf_close_out_of_memory as usize;
+        pc_vt[PC_RESET] = kf_reset as usize;
+        let mut ext = vec![0usize; 17];
+        ext[0] = pc_vt.as_ptr() as usize;
+        ext[1 + 1] = kf_add_ref as usize;
+        ext[1 + 2] = kf_release as usize;
+        ext[1 + 7] = kf_get_device as usize; // ID3D12DeviceChild::GetDevice
+        let vt = ext[1..].as_ptr();
+        let fake = |dev: usize| Box::into_raw(Box::new(KickoffFake { vt, refs: 1, resets: 0, dev }));
+        let device = fake(0);
+        let (primary, standby) = (fake(device as usize), fake(device as usize));
+        let (p, sb) = (primary as *mut c_void, standby as *mut c_void);
+        let queue = 0x7ffe_6000usize;
+        on_queue_create(queue, device as usize, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        let wait = PendingWait { va: 0x4000, width: 8, comparison: 3, value: 1, mask: u64::MAX, after_write64: false };
+        {
+            let mut g = LISTS.lock().unwrap();
+            let s = g.get_or_insert_with(HashMap::new).entry(p as usize).or_default();
+            s.allocator = 0xa110;
+            s.list_type = Some(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            s.push_wait(wait);
+            s.push_write64_signal(0x4100, 7);
+            s.cpu_writes.push(super::super::cpu_writes::Write::Immediate(0x4200, vec![1]));
+        }
+        unsafe {
+            let wrapper = title_list::wrap(p);
+            title_list::put_spare(wrapper, sb);
+            kickoff_x(p);
+
+            let kept = |list: *mut c_void| {
+                let g = LISTS.lock().unwrap();
+                let s = &g.as_ref().unwrap()[&(list as usize)];
+                (s.pending_waits.clone(), s.write64_signals.clone(), s.cpu_writes.len())
+            };
+            assert_eq!(kept(p), (vec![wait], vec![(0x4100, 7)], 1), "a failed Close keeps the recording's effects");
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrapper, &mut segs));
+            assert_eq!(segs, vec![sb], "only the closed list is submitted");
+            assert_eq!(title_list::wrapper_of(sb), Some(wrapper));
+            assert_eq!(title_list::wrapper_of(p), None);
+            assert_eq!(title_list::pop_spare(wrapper), None, "neither list is a spare");
+
+            // the title's Reset reopens the closed list, not the one whose Close failed
+            assert_eq!(title_list::reset(wrapper, 0xa110, 0), 0);
+            assert_eq!(((*primary).resets, (*standby).resets), (0, 1));
+            assert_eq!(kept(p), (Vec::new(), Vec::new(), 0), "the abandoned recording's effects go at Reset");
+            segs.clear();
+            assert!(title_list::push_segments(wrapper, &mut segs));
+            assert_eq!(segs, vec![sb]);
+            assert_eq!(title_list::wrapper_of(sb), Some(wrapper));
+
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrapper as *const *const usize)).add(2));
+            assert_eq!(rel(wrapper), 0);
+            assert_eq!(((*primary).refs, (*standby).refs, (*device).refs), (0, 0, 1));
+            on_release(p as usize);
+            on_release(sb as usize);
+            on_queue_release(queue);
+            for f in [primary, standby, device] {
+                drop(Box::from_raw(f));
+            }
         }
     }
 }
