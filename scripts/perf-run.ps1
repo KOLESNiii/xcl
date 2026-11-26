@@ -209,9 +209,12 @@ function Invoke-PerfRun([string]$Mode, [int]$Order) {
     $stdout = $stdoutTask.Result
     $stderr = $stderrTask.Result
 
-    $logLine = ($stdout -split '\r?\n' | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
+    # A run that ends normally prints `Log: <path>`; one that crashes before writing its report
+    # prints `No report - see the log: <path>` instead. Keep that log too: it is the crash record.
+    $logPattern = '^\s*(?:Log:|No report\b.*\bsee the log:)\s+(.+)$'
+    $logLine = ($stdout -split '\r?\n' | Where-Object { $_ -match $logPattern } | Select-Object -Last 1)
     if (-not $logLine) { throw "XCL printed no log path during the $Mode run (exit code $($process.ExitCode), timed out: $timedOut); its output:`n$stdout`n$stderr" }
-    $log = ($logLine -replace '^Log:\s+', '').Trim()
+    $log = ($logLine -replace $logPattern, '$1').Trim()
     if (-not (Test-Path -LiteralPath $log)) { throw "XCL's $Mode log does not exist: $log" }
     Copy-Item -LiteralPath $log -Destination (Join-Path $artifactDir 'xcl.log')
 

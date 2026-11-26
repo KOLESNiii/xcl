@@ -453,6 +453,7 @@ the cold run's directories. They are deleted afterwards, and existing user cache
 changed, or deleted. The output folder contains only each run's `xcl.log` and `report.json`, plus
 a versioned `manifest.json` with the commit, run order, hardware/toolchain, selected XCL
 environment, cache identity, durations, and exit status. It contains no game files or cache data.
+A run that crashes before writing its report keeps its log and exit code in the manifest.
 
 The manifest identifies the workload with a SHA-256 metadata fingerprint over its sorted relative
 file paths, lengths, and UTC modification-time ticks. Only the fingerprint and its algorithm/version

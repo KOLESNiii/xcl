@@ -56,6 +56,11 @@ echo seen>"%XCL_DXIL_CACHE%\seen"
 if not exist "%XCL_DATA_ROOT%\MockTitle\logs" mkdir "%XCL_DATA_ROOT%\MockTitle\logs"
 echo cache=%STATE%>"%XCL_DATA_ROOT%\MockTitle\logs\xcl.log"
 echo gpu_timing=%XCL_GPU_TIMING% threshold=%XCL_GPU_TIMING_MS%>>"%XCL_DATA_ROOT%\MockTitle\logs\xcl.log"
+if not "%MOCK_XCL_CRASH%"=="1" goto no_crash
+echo Game exited with code 0xc0000005 (3221225477)
+echo No report - see the log: %XCL_DATA_ROOT%\MockTitle\logs\xcl.log
+exit /b -1073741819
+:no_crash
 echo {"d3d12":{"adapter":"Mock GPU","submissions":2,"slowest_submission_ms":1.5,"slowest_submission_lists":3}}>"%XCL_DATA_ROOT%\MockTitle\logs\report.json"
 echo Log: %XCL_DATA_ROOT%\MockTitle\logs\xcl.log
 exit /b 0
@@ -146,6 +151,18 @@ exit /b 0
         throw 'different builds with the same folder leaf received the same workload identity'
     }
 
+    # A crash before the report: the log is still kept and the exit code recorded.
+    $crashOut = Join-Path $fixture 'crash-artifacts'
+    $env:MOCK_XCL_CRASH = '1'
+    try {
+        & (Join-Path $scripts 'perf-run.ps1') -Game $game -OutDir $crashOut -Seconds 2 *> $runLog
+    } finally {
+        Remove-Item Env:MOCK_XCL_CRASH -ErrorAction SilentlyContinue
+    }
+    $crashManifest = Get-Content -LiteralPath (Join-Path $crashOut 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($crashManifest.runs[0].exit_code -ne -1073741819 -or $null -ne $crashManifest.runs[0].artifacts.report) { throw 'a crashed run was not recorded with its exit code and without a report' }
+    if ((Get-Content -LiteralPath (Join-Path $crashOut 'runs\01-cold\xcl.log') -Raw) -notmatch 'cache=cold') { throw 'the crashed run''s log was not kept' }
+
     Add-Content -LiteralPath (Join-Path $repo '.gitignore') -Value '# dirty'
     $refused = $false
     try {
@@ -165,6 +182,6 @@ exit /b 0
     $env:XCL_PRESS_AT = $oldPress
     $env:XCL_GPU_TIMING = $oldGpuTiming
     $env:XCL_GPU_TIMING_MS = $oldGpuTimingMs
-    Remove-Item Env:MOCK_CARGO_MARKER -ErrorAction SilentlyContinue
+    Remove-Item Env:MOCK_CARGO_MARKER, Env:MOCK_XCL_CRASH -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
 }
