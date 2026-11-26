@@ -291,30 +291,139 @@ fn drop_unstarted_job(p: &Pending) {
 
 type Work = Box<dyn FnOnce() + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Work>();
-        let rx = Arc::new(Mutex::new(rx));
+/// The workers' queue and who serves it. One lock holds the work and both counts, so a
+/// helper's leaving and a worker's parking are decided together, and nobody holds it while
+/// waiting for work.
+struct Pool {
+    state: Mutex<PoolState>,
+    cv: Condvar,
+}
+
+struct PoolState {
+    work: std::collections::VecDeque<Work>,
+    /// workers waiting for a turn among the big driver compiles (`parked`)
+    parked: usize,
+    /// helpers that take the queue in their place
+    helpers: usize,
+}
+
+static POOL: Pool = Pool {
+    state: Mutex::new(PoolState { work: std::collections::VecDeque::new(), parked: 0, helpers: 0 }),
+    cv: Condvar::new(),
+};
+
+fn push_work(work: Work) {
+    static WORKERS: OnceLock<()> = OnceLock::new();
+    WORKERS.get_or_init(|| {
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                while let Some(p) = next_needed() {
-                    build_queued(&p);
-                }
-                work();
-            });
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(|| serve(false));
         }
-        Mutex::new(tx)
-    })
+    });
+    POOL.state.lock().unwrap().work.push_back(work);
+    POOL.cv.notify_one();
 }
 
+/// A worker of the queue: takes work for good; a helper (`parked`) only while more workers are
+/// parked than helpers run.
+fn serve(helper: bool) {
+    POOL_WORKER.with(|w| w.set(true));
+    loop {
+        let next = {
+            let mut s = POOL.state.lock().unwrap();
+            loop {
+                if helper && s.helpers > s.parked {
+                    s.helpers -= 1;
+                    drop(s);
+                    // (a wakeup meant for new work goes on to another worker)
+                    POOL.cv.notify_one();
+                    return;
+                }
+                if let Some(w) = s.work.pop_front() {
+                    break w;
+                }
+                s = POOL.cv.wait(s).unwrap();
+            }
+        };
+        while let Some(p) = next_needed() {
+            build_queued(&p);
+        }
+        next();
+    }
+}
+
+thread_local! {
+    /// this thread serves `POOL` (a worker or a helper)
+    static POOL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A worker of the queue is about to wait for a turn among the big driver compiles
+/// (`real::big_compile_turn`): one at a time by default, each after 3 GB of commit is free. It
+/// keeps its thread while it waits. When a retail title starts its world, every worker took
+/// one of its huge compute programs and waited there, one or two of them compiling: the queued
+/// graphics pipelines had no worker left, and the title's thread built them itself, one after
+/// another (`resolve_wait`), for minutes. A helper takes the queue for each parked thread, and
+/// a helper that takes a huge program and parks too gets one of its own, so as many threads as
+/// the pool has keep serving the queue (up to `MOST_HELPERS_PER_WORKER` helpers per worker). A
+/// helper leaves once a parked thread is back. Not a worker: nothing happens.
+pub(super) fn parked() -> Parked {
+    if !POOL_WORKER.with(|w| w.get()) {
+        return Parked(false);
+    }
+    let most = MOST_HELPERS_PER_WORKER * crate::gpu::recomp::dxc::compile_threads();
+    let start = {
+        let mut s = POOL.state.lock().unwrap();
+        s.parked += 1;
+        let start = s.helpers < s.parked.min(most);
+        s.helpers += start as usize;
+        start
+    };
+    if start {
+        spawn_helper();
+    }
+    Parked(true)
+}
+
+/// Bounds the helpers: each parked thread only holds a pipeline that has not compiled yet (a
+/// 64 MiB stack reservation, little commit); the slots and the commit check of
+/// `real::big_compile_turn` still bound the driver compiles.
+const MOST_HELPERS_PER_WORKER: usize = 4;
+
+pub(super) struct Parked(bool);
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        if self.0 {
+            let surplus = {
+                let mut s = POOL.state.lock().unwrap();
+                s.parked -= 1;
+                s.helpers > s.parked
+            };
+            // (an idle helper sees the parked thread is back and leaves)
+            if surplus {
+                POOL.cv.notify_all();
+            }
+        }
+    }
+}
+
+fn spawn_helper() {
+    let n = HELPERS_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a pipeline worker waits for a turn among the big driver compiles – a helper takes the queue meanwhile ({n} helpers so far)");
+    }
+    // (named by how many started: a live count would repeat the name of a helper still running)
+    let spawned = std::thread::Builder::new().name(format!("xcl-pso-h{}", n - 1)).stack_size(64 << 20).spawn(|| serve(true));
+    if spawned.is_err() {
+        POOL.state.lock().unwrap().helpers -= 1;
+    }
+}
+
+static HELPERS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
 fn enqueue(p: Arc<Pending>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&p)));
+    push_work(Box::new(move || build_queued(&p)));
 }
 
 fn build_queued(p: &Arc<Pending>) {
@@ -345,7 +454,7 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let parent = BUILDING.with(|b| b.borrow().clone());
     for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
         let (drain, parent) = (drain.clone(), parent.clone());
-        let _ = queue().lock().unwrap().send(Box::new(move || {
+        push_work(Box::new(move || {
             let before = BUILDING.with(|b| b.replace(parent));
             drain();
             BUILDING.with(|b| *b.borrow_mut() = before);
@@ -1022,6 +1131,74 @@ mod used_tests {
             let _ = released(standin);
         }
     }
+
+    /// Every worker waiting for a turn among the big driver compiles (`parked`) does not stop
+    /// the queue: a job sent after them is built by a helper, also when the helpers take such
+    /// jobs and park too, and the helpers leave once the parked threads are back.
+    #[test]
+    fn workers_parked_for_big_compiles_leave_the_queue_to_helpers() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+
+        struct OpenGate(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for OpenGate {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        // twice: once the helpers have left, workers that park again get helpers again
+        for round in 0..2 {
+            let (started_tx, started_rx) = mpsc::channel();
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let open = OpenGate(gate.clone());
+            for _ in 0..2 * n {
+                let (tx, g) = (started_tx.clone(), gate.clone());
+                push_work(Box::new(move || {
+                    let _parked = parked();
+                    let _ = tx.send(());
+                    let mut open = g.0.lock().unwrap();
+                    while !*open {
+                        open = g.1.wait(open).unwrap();
+                    }
+                }));
+            }
+            for _ in 0..2 * n {
+                started_rx.recv_timeout(Duration::from_secs(10)).expect("every worker and a helper for each parked");
+            }
+            let (ran_tx, ran_rx) = mpsc::channel();
+            push_work(Box::new(move || {
+                let _ = ran_tx.send(());
+            }));
+            let ran = ran_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+            drop(open);
+            assert!(ran, "round {round}: a job queued behind {n} parked workers and their parked helpers was not built");
+            // no new work: the helpers leave while the workers are idle
+            let counts = || {
+                let s = POOL.state.lock().unwrap();
+                (s.parked, s.helpers)
+            };
+            let start = Instant::now();
+            while counts() != (0, 0) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(counts(), (0, 0), "round {round}: the parked workers are back and the helpers left");
+        }
+    }
+
+    /// `parked` on a thread that is not a worker of the queue (a title's thread, a test) starts
+    /// no helper.
+    #[test]
+    fn parked_outside_the_pool_starts_no_helper() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = POOL.state.lock().unwrap().helpers;
+        let p = parked();
+        assert_eq!(POOL.state.lock().unwrap().parked, 0);
+        assert_eq!(POOL.state.lock().unwrap().helpers, before);
+        drop(p);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -1224,7 +1401,7 @@ pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
         NEEDED.lock().unwrap().push_back(p);
-        let _ = queue().lock().unwrap().send(Box::new(|| ()));
+        push_work(Box::new(|| ()));
     }
 }
 
