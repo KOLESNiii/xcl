@@ -1013,6 +1013,32 @@ impl State {
         }
     }
 
+    /// Make only the chunks overlapping `[a, a + n)` differ from their recorded hashes, so a
+    /// partial upload failure does not also resend earlier chunks in the same CPU page.
+    unsafe fn retry_sent_range(&mut self, a: usize, n: usize) {
+        let end = a + n;
+        let mut at = a;
+        while at < end {
+            let page = at & !(PAGE - 1);
+            let tile = page & !(TILE - 1);
+            let page_end = (page + PAGE).min(end);
+            if let Some(entry) = self.mapped.get_mut(&tile) {
+                let index = (page - tile) / PAGE;
+                let Some(sent) = entry.sent[index].as_mut() else {
+                    at = page_end;
+                    continue;
+                };
+                let first = (at - page) / CHUNK;
+                let last = (page_end - page).div_ceil(CHUNK);
+                let bytes = std::slice::from_raw_parts(page as *const u8, PAGE);
+                for chunk in first..last {
+                    sent[chunk] = chunk_hash(&bytes[chunk * CHUNK..(chunk + 1) * CHUNK]) ^ 1;
+                }
+            }
+            at = page_end;
+        }
+    }
+
     /// Update `sent` hashes for all 64-byte chunks overlapping `[va, va + len)` so the CPU
     /// copy-back we just wrote to `va` is not re-uploaded by the next `before_execute`.
     unsafe fn sync_sent_range(&mut self, va: usize, len: usize) {
@@ -1160,18 +1186,25 @@ impl State {
 
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
     /// the 64 MiB ring staging buffer (zero CPU stall on the common path).
-    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) {
-        self.upload_dirty_with_timeout(runs, 5000);
+    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) -> bool {
+        self.upload_dirty_with_timeout(runs, 5000)
     }
 
-    unsafe fn upload_dirty_with_timeout(&mut self, runs: &[(usize, usize)], wait_ms: u32) {
+    fn retry_dirty_from(&mut self, runs: &[(usize, usize)], index: usize, done: usize) {
+        visit_unsubmitted_dirty(runs, index, done, |a, n| unsafe { self.retry_sent_range(a, n) });
+    }
+
+    unsafe fn upload_dirty_with_timeout(&mut self, runs: &[(usize, usize)], wait_ms: u32) -> bool {
         if runs.is_empty() {
-            return;
+            return true;
         }
-        let Some(p) = self.staging_ptr() else { return };
+        let Some(p) = self.staging_ptr() else {
+            self.retry_dirty_from(runs, 0, 0);
+            return false;
+        };
         let mut open_slot: Option<usize> = None;
         let mut last_wi: Option<usize> = None;
-        for &(a, n) in runs {
+        for (run_index, &(a, n)) in runs.iter().enumerate() {
             let mut done = 0usize;
             while done < n {
                 let cur = a + done;
@@ -1182,7 +1215,10 @@ impl State {
                             last_wi = Some(i);
                             i
                         }
-                        None => break,
+                        None => {
+                            self.retry_dirty_from(runs, run_index, done);
+                            return false;
+                        }
                     },
                 };
                 let b = self.windows[wi].0;
@@ -1196,15 +1232,21 @@ impl State {
                             self.reclaim_ring();
                         }
                         while (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
-                            let Some(&(fv, _)) = self.inflight.front() else { break };
+                            let Some(&(fv, _)) = self.inflight.front() else {
+                                self.retry_dirty_from(runs, run_index, done);
+                                crate::xlog_warn!("sparse: the staging ring is full without a retirement fence; the unsubmitted CPU writes will be retried");
+                                return false;
+                            };
                             let reached = self.wait_for_ms(fv, wait_ms);
                             self.reclaim_ring();
                             if !reached {
-                                static RING_STALL: AtomicU64 = AtomicU64::new(0);
-                                if RING_STALL.fetch_add(1, Ordering::Relaxed) < 4 {
-                                    crate::xlog_warn!("sparse: staging ring reclaim timed out at fence {fv}; leaving remaining dirty uploads to avoid holding STATE forever");
+                                self.retry_dirty_from(runs, run_index, done);
+                                static RING_STALLS: AtomicU64 = AtomicU64::new(0);
+                                let stalls = RING_STALLS.fetch_add(1, Ordering::Relaxed) + 1;
+                                if stalls <= 4 || stalls.is_power_of_two() {
+                                    crate::xlog_warn!("sparse: staging ring reclaim timed out at fence {fv}; the unsubmitted CPU writes will be retried ({stalls} stalls)");
                                 }
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -1228,6 +1270,7 @@ impl State {
         if let Some(slot_idx) = open_slot {
             self.submit_slot(slot_idx);
         }
+        true
     }
 }
 
@@ -1353,7 +1396,9 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         pg = tile_end;
     }
     if !dirty_runs.is_empty() {
-        s.upload_dirty(&dirty_runs);
+        if !s.upload_dirty(&dirty_runs) {
+            return;
+        }
     }
     s.readback_ranges(&[(va, len)]);
 }
@@ -1585,6 +1630,16 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
 }
 
+fn visit_unsubmitted_dirty(runs: &[(usize, usize)], index: usize, done: usize, mut visit: impl FnMut(usize, usize)) {
+    let (a, n) = runs[index];
+    if done < n {
+        visit(a + done, n - done);
+    }
+    for &(a, n) in &runs[index + 1..] {
+        visit(a, n);
+    }
+}
+
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
@@ -1643,7 +1698,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         s.upload_zeros(&zero_runs);
     }
     if !dirty_runs.is_empty() {
-        s.upload_dirty(&dirty_runs);
+        let _ = s.upload_dirty(&dirty_runs);
     }
     PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
     {
@@ -1785,6 +1840,18 @@ mod tests {
         drop(held);
         asked.join().unwrap();
         assert!(answered, "queue() waited for the sparse state's lock");
+    }
+
+    #[test]
+    fn a_stalled_ring_retries_only_the_unsubmitted_dirty_suffix() {
+        let runs = [(0x1000, 0x180), (0x3000, 0x80), (0x5000, 0x40)];
+        let mut retry = Vec::new();
+        visit_unsubmitted_dirty(&runs, 0, 0x100, |a, n| retry.push((a, n)));
+        assert_eq!(retry, [(0x1100, 0x80), (0x3000, 0x80), (0x5000, 0x40)]);
+
+        retry.clear();
+        visit_unsubmitted_dirty(&runs, 1, 0x80, |a, n| retry.push((a, n)));
+        assert_eq!(retry, [(0x5000, 0x40)], "a fully submitted run is not made stale again");
     }
 
     /// A block freed on one thread while another allocates: its address goes back to the
@@ -2335,6 +2402,37 @@ mod tests {
             scratch_runs: Vec::new(),
         };
         (base, s)
+    }
+
+    #[test]
+    fn a_stalled_upload_ring_returns_and_retries_exact_chunks() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE};
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            assert_eq!(VirtualAlloc(base as *mut c_void, TILE, MEM_COMMIT, PAGE_READWRITE) as usize, base);
+            std::ptr::write_bytes(base as *mut u8, 0x5a, PAGE);
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            s.sync_sent_range(base, PAGE);
+            let before = *s.mapped[&base].sent[0].as_ref().unwrap().clone();
+
+            s.ring_write = STAGING as u64;
+            s.ring_submitted = STAGING as u64;
+            s.ring_free = 0;
+            s.inflight.push_back((s.value + 1, STAGING as u64));
+            let started = std::time::Instant::now();
+            assert!(!s.upload_dirty_with_timeout(&[(base + CHUNK, 2 * CHUNK)], 20));
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "a stalled fence kept upload_dirty in its ring loop");
+            let after = s.mapped[&base].sent[0].as_ref().unwrap();
+            assert_eq!(after[0], before[0], "an already submitted chunk was made dirty again");
+            assert_ne!(after[1], before[1]);
+            assert_ne!(after[2], before[2]);
+            assert_eq!(after[3], before[3]);
+
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
     }
 
     /// `flush_parked` must keep unmapped pool tiles out of `free` (and `take_tile` must not reuse
