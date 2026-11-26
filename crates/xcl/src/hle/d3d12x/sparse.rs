@@ -1187,13 +1187,17 @@ impl State {
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
     /// (zero staging ring bytes consumed, zero CPU stall).
     unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) -> bool {
+        self.upload_zeros_with_timeout(runs, 5000)
+    }
+
+    unsafe fn upload_zeros_with_timeout(&mut self, runs: &[(usize, usize)], wait_ms: u32) -> bool {
         if runs.is_empty() {
             return true;
         }
         if !self.ensure_zero_buf() {
             return false;
         }
-        let Some(slot_idx) = self.begin_slot() else { return false };
+        let Some(slot_idx) = self.begin_slot_with_timeout(wait_ms) else { return false };
         let mut last_wi: Option<usize> = None;
         let zero_buf = self.zero_buf.as_ref().unwrap();
         let list = &self.slots[slot_idx].list;
@@ -1220,6 +1224,18 @@ impl State {
         }
         self.submit_slot(slot_idx);
         true
+    }
+
+    /// Tile clears `zero_runs`, then CPU writes `dirty_runs`, so that overlapping copies have no
+    /// write-after-write hazard. When the clears cannot be submitted they go back to `to_zero`
+    /// and the CPU writes wait with them: sent now, they would be zeroed by the clears sent later.
+    unsafe fn upload_zeros_then_dirty(&mut self, zero_runs: &[(usize, usize)], dirty_runs: &[(usize, usize)], wait_ms: u32) -> bool {
+        if !self.upload_zeros_with_timeout(zero_runs, wait_ms) {
+            self.to_zero.extend_from_slice(zero_runs);
+            self.retry_dirty_from(dirty_runs, 0, 0);
+            return false;
+        }
+        self.upload_dirty_with_timeout(dirty_runs, wait_ms)
     }
 
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
@@ -1675,6 +1691,10 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 }
 
 fn visit_unsubmitted_dirty(runs: &[(usize, usize)], index: usize, done: usize, mut visit: impl FnMut(usize, usize)) {
+    // Failed tile clears retry the CPU writes from run 0, also when the submit had none.
+    if index >= runs.len() {
+        return;
+    }
     let (a, n) = runs[index];
     if done < n {
         visit(a + done, n - done);
@@ -1738,15 +1758,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
-    // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
-    if !zero_runs.is_empty() {
-        if !s.upload_zeros(&zero_runs) {
-            s.to_zero.extend(zero_runs.iter().copied());
-        }
-    }
-    if !dirty_runs.is_empty() {
-        let _ = s.upload_dirty(&dirty_runs);
-    }
+    let _ = s.upload_zeros_then_dirty(&zero_runs, &dirty_runs, 5000);
     PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
     {
         static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1899,6 +1911,10 @@ mod tests {
         retry.clear();
         visit_unsubmitted_dirty(&runs, 1, 0x80, |a, n| retry.push((a, n)));
         assert_eq!(retry, [(0x5000, 0x40)], "a fully submitted run is not made stale again");
+
+        retry.clear();
+        visit_unsubmitted_dirty(&[], 0, 0, |a, n| retry.push((a, n)));
+        assert!(retry.is_empty(), "failed tile clears with no CPU writes retry nothing");
     }
 
     /// A block freed on one thread while another allocates: its address goes back to the
@@ -2519,6 +2535,44 @@ mod tests {
             runs.clear();
             s.scan_retry_pages(&mut runs);
             assert!(runs.is_empty(), "a rescanned page stays marked: {runs:x?}");
+
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Tile clears that cannot be submitted keep the CPU writes back with them: sent first, the
+    /// writes would be zeroed by the clears submitted at a later upload.
+    #[test]
+    fn cpu_writes_wait_for_tile_clears_that_could_not_be_submitted() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE};
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            assert_eq!(VirtualAlloc(base as *mut c_void, TILE, MEM_COMMIT, PAGE_READWRITE) as usize, base);
+            std::ptr::write_bytes(base as *mut u8, 0x5a, PAGE);
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            s.sync_sent_range(base, PAGE);
+            let before = *s.mapped[&base].sent[0].as_ref().unwrap().clone();
+
+            // the clears get the first slot, still in flight; the CPU writes could get the second
+            for fence_val in [s.value + 1, 0] {
+                let alloc = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = s.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                list.Close().unwrap();
+                s.slots.push(UploadSlot { alloc, list, fence_val });
+            }
+            s.next_slot = 0;
+            let value = s.value;
+            assert!(!s.upload_zeros_then_dirty(&[(base + PAGE, PAGE)], &[(base + CHUNK, CHUNK)], 20));
+            assert_eq!(s.value, value, "CPU writes were submitted before the tile clears");
+            assert_eq!(s.ring_write, 0);
+            assert_eq!(s.to_zero, vec![(base + PAGE, PAGE)]);
+            let after = s.mapped[&base].sent[0].as_ref().unwrap();
+            assert_ne!(after[1], before[1], "the held-back CPU write is not marked for the next upload");
+            assert_eq!(after[0], before[0]);
+            assert_eq!(s.retry_pages, vec![base]);
 
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
