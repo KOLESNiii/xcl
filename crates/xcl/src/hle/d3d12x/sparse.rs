@@ -264,6 +264,9 @@ struct State {
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// pages with chunks `retry_sent_range` marked unsent: `before_execute` scans them again,
+    /// since the write-watch that reported them has been reset
+    retry_pages: Vec<usize>,
 }
 
 impl Drop for State {
@@ -596,6 +599,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            retry_pages: Vec::new(),
         })
     })();
     match made {
@@ -1029,6 +1033,7 @@ impl State {
             let tile = page & !(TILE - 1);
             let page_end = (page + PAGE).min(end);
             if let Some(entry) = self.mapped.get_mut(&tile) {
+                self.retry_pages.push(page);
                 let index = (page - tile) / PAGE;
                 let Some(sent) = entry.sent[index].as_mut() else {
                     at = page_end;
@@ -1042,6 +1047,24 @@ impl State {
                 }
             }
             at = page_end;
+        }
+    }
+
+    /// Scan the pages in `retry_pages` again into `out`: without it, their unsent chunks waited
+    /// for the CPU to write the page again.
+    unsafe fn scan_retry_pages(&mut self, out: &mut Vec<(usize, usize)>) {
+        let mut pages = std::mem::take(&mut self.retry_pages);
+        pages.sort_unstable();
+        pages.dedup();
+        for &pg in &pages {
+            let t = pg & !(TILE - 1);
+            if let Some(entry) = self.mapped.get_mut(&t) {
+                let idx = (pg - t) / PAGE;
+                if entry.holes & (1u16 << idx) == 0 {
+                    let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                    scan_page(bytes, pg, &mut entry.sent[idx], out);
+                }
+            }
         }
     }
 
@@ -1711,6 +1734,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             x = end;
         }
     }
+    s.scan_retry_pages(&mut dirty_runs);
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
@@ -1993,6 +2017,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -2201,6 +2226,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -2298,6 +2324,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             s.commit_range(base, TILE);
@@ -2423,6 +2450,7 @@ mod tests {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            retry_pages: Vec::new(),
         };
         (base, s)
     }
@@ -2459,6 +2487,38 @@ mod tests {
             s.slots.push(UploadSlot { alloc, list, fence_val: s.value + 1 });
             s.next_slot = 0;
             assert_eq!(s.begin_slot_with_timeout(20), None, "a timed-out slot must not reset its in-flight allocator");
+
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// The write-watch that reported a page is reset when it is scanned, so chunks a stalled
+    /// upload left unsent are found again by the next submit without another CPU write.
+    #[test]
+    fn unsent_chunks_are_scanned_again_without_a_new_cpu_write() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE};
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            assert_eq!(VirtualAlloc(base as *mut c_void, TILE, MEM_COMMIT, PAGE_READWRITE) as usize, base);
+            std::ptr::write_bytes(base as *mut u8, 0x5a, PAGE);
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            s.sync_sent_range(base, PAGE);
+
+            s.ring_write = STAGING as u64;
+            s.ring_submitted = STAGING as u64;
+            s.ring_free = 0;
+            s.inflight.push_back((s.value + 1, STAGING as u64));
+            assert!(!s.upload_dirty_with_timeout(&[(base + CHUNK, 2 * CHUNK)], 20));
+
+            let mut runs = Vec::new();
+            s.scan_retry_pages(&mut runs);
+            assert_eq!(runs, vec![(base + CHUNK, 2 * CHUNK)], "the unsent chunks were not found again");
+            runs.clear();
+            s.scan_retry_pages(&mut runs);
+            assert!(runs.is_empty(), "a rescanned page stays marked: {runs:x?}");
 
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
@@ -2854,6 +2914,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
                 quarantined: VecDeque::new(),
                 queue_fences: FxHashMap::default(),
             };
