@@ -25,6 +25,7 @@ $oldDxil = $env:XCL_DXIL_CACHE
 $oldPress = $env:XCL_PRESS_AT
 $oldGpuTiming = $env:XCL_GPU_TIMING
 $oldGpuTimingMs = $env:XCL_GPU_TIMING_MS
+$oldPipelineThreads = $env:XCL_PIPELINE_THREADS
 
 try {
     $null = New-Item -ItemType Directory -Path $scripts, $game, $bin, $userData, $userDxil
@@ -80,6 +81,7 @@ exit /b 0
     $env:XCL_PRESS_AT = '20:A,24:A'
     $env:XCL_GPU_TIMING = 'caller-value'
     $env:XCL_GPU_TIMING_MS = '999'
+    $env:XCL_PIPELINE_THREADS = '1'
 
     # Redirected like a queued or logged run: Windows PowerShell then turns native stderr (cargo's
     # progress) into error records, which must not stop the script.
@@ -96,6 +98,11 @@ exit /b 0
     if ($manifest.environment.XCL_PRESS_AT -ne '20:A,24:A') { throw 'input schedule was not recorded' }
     if ($manifest.environment.XCL_GPU_TIMING -ne '1' -or $manifest.environment.XCL_GPU_TIMING_MS -ne '50') {
         throw 'submission timing settings were not forced and recorded'
+    }
+    if ($manifest.environment.XCL_PIPELINE_THREADS -ne '1') { throw 'an inherited XCL setting was not recorded' }
+    $recordedNames = @($manifest.environment.PSObject.Properties.Name)
+    if (@($recordedNames | Where-Object { $_ -in @('XCL_DATA_ROOT', 'XCL_DXIL_CACHE') -or $_ -like 'XCL_PERF_RUN_*' }).Count -ne 0) {
+        throw 'per-run cache paths or test hooks were recorded'
     }
     if ($manifest.workload_id_algorithm -ne 'sha256-relative-path-length-mtime-utc-ticks' -or
         $manifest.workload_id_version -ne 1) { throw 'workload identity algorithm/version was not recorded' }
@@ -182,6 +189,7 @@ exit /b 0
     $env:XCL_PRESS_AT = $oldPress
     $env:XCL_GPU_TIMING = $oldGpuTiming
     $env:XCL_GPU_TIMING_MS = $oldGpuTimingMs
+    $env:XCL_PIPELINE_THREADS = $oldPipelineThreads
     Remove-Item Env:MOCK_CARGO_MARKER, Env:MOCK_XCL_CRASH -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
 }

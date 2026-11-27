@@ -149,14 +149,11 @@ $dxilCache = Join-Path $cacheRoot 'dxil'
 $null = New-Item -ItemType Directory -Path $dataRoot
 $null = New-Item -ItemType Directory -Path $dxilCache
 
-$environmentNames = @(
-    'XCL_ACTIVITY', 'XCL_ADAPTER', 'XCL_DEVICE_TYPE', 'XCL_DIRECT_DXIL',
-    'XCL_DXC_THREADS', 'XCL_FRAME_INTERVAL_US', 'XCL_HEAP_WINDOWS',
-    'XCL_GPU_TIMING', 'XCL_GPU_TIMING_MS', 'XCL_LAZY_PSO', 'XCL_NETWORK', 'XCL_PRESS_AT', 'XCL_PSO_PRELOAD',
-    'XCL_REQUIRE_GPU', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE'
-)
 $changedNames = @('XCL_ACTIVITY', 'XCL_DATA_ROOT', 'XCL_DXIL_CACHE', 'XCL_GPU_TIMING', 'XCL_GPU_TIMING_MS',
     'XCL_NETWORK', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE')
+# Every XCL_* setting the runs inherit is recorded, since the runtime reads far more switches than a
+# list could keep up with. Left out: the per-run cache paths set below and this script's test hooks.
+$unrecordedNames = @('XCL_DATA_ROOT', 'XCL_DXIL_CACHE')
 $savedEnvironment = @{}
 foreach ($name in $changedNames) {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -254,7 +251,11 @@ try {
     $env:XCL_STALL_TRACE = '1'
 
     $recordedEnvironment = [ordered]@{}
-    foreach ($name in $environmentNames) {
+    [string[]]$recordedNames = @([Environment]::GetEnvironmentVariables('Process').Keys |
+        ForEach-Object { ([string]$_).ToUpperInvariant() } |
+        Where-Object { $_.StartsWith('XCL_') -and -not $_.StartsWith('XCL_PERF_RUN_') -and $_ -notin $unrecordedNames })
+    [Array]::Sort($recordedNames, [StringComparer]::Ordinal)
+    foreach ($name in $recordedNames) {
         $recordedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
 
