@@ -26,6 +26,7 @@ $oldPress = $env:XCL_PRESS_AT
 $oldGpuTiming = $env:XCL_GPU_TIMING
 $oldGpuTimingMs = $env:XCL_GPU_TIMING_MS
 $oldPipelineThreads = $env:XCL_PIPELINE_THREADS
+$oldPrepareAll = $env:XCL_PREPARE_ALL
 
 try {
     $null = New-Item -ItemType Directory -Path $scripts, $game, $bin, $userData, $userDxil
@@ -91,6 +92,7 @@ echo late child write>>"%XCL_DATA_ROOT%\MockTitle\logs\xcl.log"
     $env:XCL_GPU_TIMING = 'caller-value'
     $env:XCL_GPU_TIMING_MS = '999'
     $env:XCL_PIPELINE_THREADS = '1'
+    $env:XCL_PREPARE_ALL = '1'
 
     # Redirected like a queued or logged run: Windows PowerShell then turns native stderr (cargo's
     # progress) into error records, which must not stop the script.
@@ -109,6 +111,7 @@ echo late child write>>"%XCL_DATA_ROOT%\MockTitle\logs\xcl.log"
         throw 'submission timing settings were not forced and recorded'
     }
     if ($manifest.environment.XCL_PIPELINE_THREADS -ne '1') { throw 'an inherited XCL setting was not recorded' }
+    if ($manifest.environment.XCL_PREPARE_ALL -ne '1') { throw 'the shader preparation switch was not recorded' }
     $recordedNames = @($manifest.environment.PSObject.Properties.Name)
     if (@($recordedNames | Where-Object { $_ -in @('XCL_DATA_ROOT', 'XCL_DXIL_CACHE') -or $_ -like 'XCL_PERF_RUN_*' }).Count -ne 0) {
         throw 'per-run cache paths or test hooks were recorded'
@@ -250,6 +253,7 @@ static class Shim {
     $env:XCL_GPU_TIMING = $oldGpuTiming
     $env:XCL_GPU_TIMING_MS = $oldGpuTimingMs
     $env:XCL_PIPELINE_THREADS = $oldPipelineThreads
+    $env:XCL_PREPARE_ALL = $oldPrepareAll
     Remove-Item Env:MOCK_CARGO_MARKER, Env:MOCK_XCL_CRASH, Env:MOCK_XCL_ARGS -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
 }

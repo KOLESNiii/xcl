@@ -451,8 +451,8 @@ the title, which can take far longer than the default two minutes allowed for st
 `-StartupTimeoutSeconds` as `smoke.ps1` takes. Both runs use a new temporary `XCL_DATA_ROOT` and `XCL_DXIL_CACHE`; the warm run reuses
 the cold run's directories. They are deleted afterwards, and existing user caches are never read,
 changed, or deleted. The output folder contains only each run's `xcl.log` and `report.json`, plus
-a versioned `manifest.json` with the commit, run order, hardware/toolchain, selected XCL
-environment, cache identity, durations, and exit status. It contains no game files or cache data.
+a versioned `manifest.json` with the commit, run order, hardware/toolchain, every `XCL_*`
+setting the runs inherit (except the cache paths above), cache identity, durations, and exit status. It contains no game files or cache data.
 A run that crashes before writing its report keeps its log and exit code in the manifest.
 
 The manifest identifies the workload with a SHA-256 metadata fingerprint over its sorted relative
