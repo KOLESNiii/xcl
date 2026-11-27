@@ -1108,8 +1108,22 @@ impl State {
                 }
                 s.signal();
                 s.rb_last_fence = s.value;
-                s.wait_for(s.value);
+                let reached = s.wait_for(s.value);
                 s.reclaim_ring();
+                if !reached {
+                    // The copies into the readback buffer have not run: it still holds an earlier
+                    // readback, of other addresses. The CPU view keeps its bytes and `sent` its
+                    // hashes.
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        let bytes: usize = pending.iter().map(|r| r.2).sum();
+                        crate::xlog_warn!("sparse: {n} readbacks not done after the wait were not copied ({bytes} bytes of the CPU view left as they were this time)");
+                    }
+                    pending.clear();
+                    *used = 0;
+                    return;
+                }
             }
             for &(dst, off, len) in pending.iter() {
                 // copy only committed (non-hole) bytes
@@ -2491,6 +2505,49 @@ mod tests {
             later.join().expect("signalling thread");
             assert!(reached, "the wait ended on a stale wake after {waited:?} (fence at {})", s.fence.GetCompletedValue());
             assert!(waited >= std::time::Duration::from_millis(10), "the wait ended before the value was signalled ({waited:?})");
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A readback whose wait gives up has not copied into the readback buffer yet: the buffer
+    /// still holds an earlier readback, of other addresses, which must not land in the CPU view.
+    #[test]
+    fn a_readback_the_wait_gave_up_on_leaves_the_cpu_view_as_it_was() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            assert!(!VirtualAlloc(base as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            s.commit_range(base, PAGE);
+            let alloc: ID3D12CommandAllocator = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = s.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            list.Close().expect("list close");
+            s.slots.push(UploadSlot { alloc, list, fence_val: 0 });
+            // what the GPU holds for the page
+            std::ptr::write_bytes(base as *mut u8, 0x3C, PAGE);
+            s.upload_dirty(&[(base, PAGE)]);
+            assert!(s.wait_for(s.value));
+            std::ptr::write_bytes(base as *mut u8, 0xAA, PAGE);
+            // what an earlier readback left in the buffer
+            let (_, p) = s.readback_buf().expect("readback buffer");
+            std::ptr::write_bytes(p, 0xBB, PAGE);
+
+            let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+            let unblock = SignalOnDrop(gate.clone(), 1);
+            s.queue.Wait(&gate, 1).expect("gate sparse queue");
+            WAIT_MS.with(|w| w.set(Some(20)));
+            s.readback_ranges(&[(base, PAGE)]);
+            WAIT_MS.with(|w| w.set(None));
+            let view = std::slice::from_raw_parts(base as *const u8, PAGE);
+            assert!(view.iter().all(|&b| b == 0xAA), "bytes of an earlier readback were copied into the CPU view");
+
+            gate.Signal(1).expect("release sparse queue");
+            assert!(s.wait_for(s.value));
+            // the same readback again, once the queue can run it, brings the GPU's bytes
+            s.readback_ranges(&[(base, PAGE)]);
+            assert!(view.iter().all(|&b| b == 0x3C), "a readback after the queue was released did not copy the GPU's bytes");
+            drop(unblock);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
