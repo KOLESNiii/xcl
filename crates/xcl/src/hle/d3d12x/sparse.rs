@@ -43,6 +43,15 @@ const STAGING: usize = 64 << 20;
 const RING_ALIGN: usize = 64;
 /// number of in-flight upload command allocators / lists
 const UPLOAD_SLOTS: usize = 16;
+
+/// How long a wait for the sparse queue goes on before it gives up: 5 s (tests set less).
+fn wait_ms() -> u32 {
+    #[cfg(test)]
+    if let Some(ms) = tests::WAIT_MS.with(|w| w.get()) {
+        return ms;
+    }
+    5000
+}
 /// bytes of the dedicated pre-zeroed buffer for tile/hole clears (1 MiB)
 const ZERO_BUF: usize = 1 << 20;
 /// bytes of the GPU→CPU readback staging buffer
@@ -258,6 +267,9 @@ struct State {
     rb_alloc: ID3D12CommandAllocator,
     rb_list: ID3D12GraphicsCommandList,
     rb_last_fence: u64,
+    /// allocators and lists whose submission (the fence value with them) a bounded wait gave up
+    /// on, kept until the queue has passed it (`hold_pending`)
+    held_lists: Vec<(u64, ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     /// the fence value each title queue last waited for
     waited: FxHashMap<usize, u64>,
     /// `mapped` as sorted (start, end) runs (None: to be made again)
@@ -572,6 +584,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             rb_alloc,
             rb_list,
             rb_last_fence: 0,
+            held_lists: Vec::new(),
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
@@ -829,20 +842,60 @@ impl State {
         let _ = self.queue.Signal(&self.fence, self.value);
     }
 
+    /// Waits at most `wait_ms()` for the queue to reach `target`; whether it has.
     #[inline]
-    unsafe fn wait_for(&self, target: u64) {
+    unsafe fn wait_for(&self, target: u64) -> bool {
         if target == 0 || self.fence.GetCompletedValue() >= target {
-            return;
+            return true;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
+        let ms = wait_ms();
+        windows::Win32::System::Threading::WaitForSingleObject(self.event, ms);
+        let reached = self.fence.GetCompletedValue() >= target;
+        if !reached {
+            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after {} s (at {})", ms as f64 / 1000.0, self.fence.GetCompletedValue());
+        }
+        reached
+    }
+
+    /// `alloc` and `list`, last submitted at fence value `fv`, which a bounded wait gave up on:
+    /// the GPU may still execute that submission, and resetting them then is not allowed. They go
+    /// to `held_lists` until the queue has passed `fv` (`reclaim_ring`), and a new pair takes
+    /// their place. Whether it did: when no new pair can be made, this waits for `fv` without a
+    /// bound instead. (After Vice-Tay b06fdd5, where a timed-out submission stays pending until
+    /// its fence has passed.)
+    unsafe fn hold_pending(&mut self, fv: u64, alloc: &mut ID3D12CommandAllocator, list: &mut ID3D12GraphicsCommandList) -> bool {
+        let made = (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+            let a: ID3D12CommandAllocator = self.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let l: ID3D12GraphicsCommandList = self.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None)?;
+            l.Close()?;
+            Ok((a, l))
+        })();
+        match made {
+            Ok((a, l)) => {
+                let _ = l.SetName(windows::core::w!("xcl sparse list (in place of one still in flight)"));
+                self.held_lists.push((fv, std::mem::replace(alloc, a), std::mem::replace(list, l)));
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    crate::xlog_warn!("sparse: {n} command lists still in flight after the wait were held, not reset ({} held now)", self.held_lists.len());
+                }
+                true
+            }
+            Err(e) => {
+                crate::xlog_warn!("sparse: no new command list in place of one still in flight ({e}): waiting for fence value {fv}");
+                while !self.wait_for(fv) {}
+                false
+            }
         }
     }
 
     #[inline]
     unsafe fn reclaim_ring(&mut self) {
+        if !self.held_lists.is_empty() {
+            let completed = self.fence.GetCompletedValue();
+            self.held_lists.retain(|h| h.0 > completed);
+        }
         if self.inflight.is_empty() {
             return;
         }
@@ -858,13 +911,20 @@ impl State {
     }
 
     /// Acquire the next upload command slot, waiting only if that slot's previous submission is
-    /// still executing on the GPU, then reset its allocator and list.
+    /// still executing on the GPU, then reset its allocator and list (a pair the wait gave up on
+    /// is held and replaced: `hold_pending`).
     unsafe fn begin_slot(&mut self) -> usize {
         let idx = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
         let fv = self.slots[idx].fence_val;
         if fv > 0 && self.fence.GetCompletedValue() < fv {
-            self.wait_for(fv);
+            if !self.wait_for(fv) {
+                let (mut alloc, mut list) = (self.slots[idx].alloc.clone(), self.slots[idx].list.clone());
+                if self.hold_pending(fv, &mut alloc, &mut list) {
+                    let slot = &mut self.slots[idx];
+                    (slot.alloc, slot.list, slot.fence_val) = (alloc, list, 0);
+                }
+            }
             self.reclaim_ring();
         }
         let slot = &self.slots[idx];
@@ -1082,7 +1142,13 @@ impl State {
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
                 if !open {
-                    self.wait_for(self.rb_last_fence);
+                    let fv = self.rb_last_fence;
+                    if !self.wait_for(fv) {
+                        let (mut alloc, mut list) = (self.rb_alloc.clone(), self.rb_list.clone());
+                        if self.hold_pending(fv, &mut alloc, &mut list) {
+                            (self.rb_alloc, self.rb_list) = (alloc, list);
+                        }
+                    }
                     let _ = self.rb_alloc.Reset();
                     let _ = self.rb_list.Reset(&self.rb_alloc, None);
                     open = true;
@@ -1733,6 +1799,11 @@ fn forget_in(s: &mut State, res: usize) {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// `wait_ms` on this test's thread (None: the runtime's 5 s)
+        pub(super) static WAIT_MS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
     /// waiting for (a list's `Reset` against an upload's allocator `Reset`, with `XCL_DRED=1`).
@@ -1863,6 +1934,7 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                held_lists: Vec::new(),
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
@@ -2071,6 +2143,7 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                held_lists: Vec::new(),
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
@@ -2168,6 +2241,7 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                held_lists: Vec::new(),
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
@@ -2293,6 +2367,7 @@ mod tests {
             rb_alloc,
             rb_list,
             rb_last_fence: 0,
+            held_lists: Vec::new(),
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
@@ -2331,6 +2406,48 @@ mod tests {
             assert!(s.free.contains(&tile), "unmapped tile must return to free list once unmap fence completes");
             drop(_unblock);
             s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// An upload slot whose submission the queue has not finished when the bounded wait gives up
+    /// is not reset (the GPU may still execute it): its allocator and list are held until the
+    /// queue has passed that submission, and the slot goes on with a new pair.
+    #[test]
+    fn a_slot_still_in_flight_after_the_wait_is_held_not_reset() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            let alloc: ID3D12CommandAllocator = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = s.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            list.Close().expect("list close");
+            s.slots.push(UploadSlot { alloc, list, fence_val: 0 });
+
+            let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+            let unblock = SignalOnDrop(gate.clone(), 1);
+            s.queue.Wait(&gate, 1).expect("gate sparse queue");
+
+            // a submission the queue cannot reach while `gate` holds it
+            let idx = s.begin_slot();
+            s.submit_slot(idx);
+            let first = s.slots[idx].alloc.as_raw();
+            // the one slot comes round again, and its wait gives up
+            WAIT_MS.with(|w| w.set(Some(20)));
+            let again = s.begin_slot();
+            WAIT_MS.with(|w| w.set(None));
+            assert_eq!(again, idx);
+            assert_ne!(s.slots[idx].alloc.as_raw(), first, "an allocator the GPU may still execute was reset for reuse");
+            assert_eq!(s.held_lists.len(), 1);
+            assert_eq!(s.held_lists[0].1.as_raw(), first);
+            s.submit_slot(again);
+
+            gate.Signal(1).expect("release sparse queue");
+            assert!(s.wait_for(s.value));
+            s.reclaim_ring();
+            assert!(s.held_lists.is_empty(), "a held pair goes once the queue has passed its submission");
+            drop(unblock);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
