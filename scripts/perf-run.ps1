@@ -183,7 +183,9 @@ function Invoke-PerfRun([string]$Mode, [int]$Order) {
         $psi.Arguments = '/d /c ""' + $xcl + '" run "' + $gamePath + '""'
     } else {
         $psi.FileName = $xcl
-        $psi.Arguments = 'run "' + $gamePath + '"'
+        # Windows argument parsing halves backslashes before a quote, so a folder given with a
+        # trailing separator needs that run doubled or its closing quote becomes part of the path.
+        $psi.Arguments = 'run "' + ($gamePath -replace '(\\+)$', '$1$1') + '"'
     }
     $psi.WorkingDirectory = $root
     $psi.UseShellExecute = $false

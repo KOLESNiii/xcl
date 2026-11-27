@@ -178,6 +178,38 @@ exit /b 0
         $refused = $_.Exception.Message -match 'clean worktree'
     }
     if (-not $refused) { throw 'a dirty worktree was not refused' }
+    Set-Content -LiteralPath (Join-Path $repo '.gitignore') -Value 'target/' -Encoding Ascii
+
+    # A real executable parses its command line the way XCL does (a command file does not): a game
+    # folder with a space and a trailing separator must arrive as given. The shim records its
+    # arguments, then hands over to the mock.
+    $nativeXcl = Join-Path $bin 'mock-xcl.exe'
+    $nativeArgs = Join-Path $fixture 'native-args.txt'
+    $shimSource = Join-Path $fixture 'shim.cs'
+    @'
+using System;
+using System.Diagnostics;
+using System.IO;
+static class Shim {
+    static int Main(string[] args) {
+        File.WriteAllLines(Environment.GetEnvironmentVariable("MOCK_XCL_ARGS"), args);
+        var cmd = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mock-xcl.cmd");
+        var psi = new ProcessStartInfo("cmd.exe", "/d /c \"\"" + cmd + "\"\"") { UseShellExecute = false };
+        using (var p = Process.Start(psi)) { p.WaitForExit(); return p.ExitCode; }
+    }
+}
+'@ | Set-Content -LiteralPath $shimSource -Encoding Ascii
+    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    & $csc /nologo /target:exe "/out:$nativeXcl" $shimSource | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'could not compile the native mock' }
+    $env:XCL_PERF_RUN_TEST_XCL = $nativeXcl
+    $env:MOCK_XCL_ARGS = $nativeArgs
+    $slashGame = $game + '\'
+    & (Join-Path $scripts 'perf-run.ps1') -Game $slashGame -OutDir (Join-Path $fixture 'native-artifacts') -Seconds 2 *> $runLog
+    $received = @(Get-Content -LiteralPath $nativeArgs)
+    if ($received.Count -ne 2 -or $received[0] -ne 'run' -or $received[1] -ne $slashGame) {
+        throw "the native launch received [$($received -join '] [')] instead of [run] [$slashGame]"
+    }
 
     Write-Host 'perf-run tests: all assertions passed'
 } finally {
@@ -190,6 +222,6 @@ exit /b 0
     $env:XCL_GPU_TIMING = $oldGpuTiming
     $env:XCL_GPU_TIMING_MS = $oldGpuTimingMs
     $env:XCL_PIPELINE_THREADS = $oldPipelineThreads
-    Remove-Item Env:MOCK_CARGO_MARKER, Env:MOCK_XCL_CRASH -ErrorAction SilentlyContinue
+    Remove-Item Env:MOCK_CARGO_MARKER, Env:MOCK_XCL_CRASH, Env:MOCK_XCL_ARGS -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
 }
