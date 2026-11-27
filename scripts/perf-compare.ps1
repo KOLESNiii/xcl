@@ -346,7 +346,7 @@ if ([int]$beforeManifest.workload_id_version -ne [int]$afterManifest.workload_id
 }
 if ((@($beforeManifest.run_order) -join ',') -ne (@($afterManifest.run_order) -join ',')) { throw 'run order differs; runs are incomparable' }
 Require-Same-Property $beforeManifest $afterManifest 'system' 'system information'
-if (($beforeManifest.environment | ConvertTo-Json -Compress -Depth 6) -ne ($afterManifest.environment | ConvertTo-Json -Compress -Depth 6)) {
+if (($beforeManifest.environment | ConvertTo-Json -Compress -Depth 6) -cne ($afterManifest.environment | ConvertTo-Json -Compress -Depth 6)) {
     throw 'runtime environment differs; runs are incomparable'
 }
 

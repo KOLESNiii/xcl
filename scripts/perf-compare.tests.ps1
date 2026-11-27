@@ -352,6 +352,19 @@ try {
     try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'xcl-cold startup timeout differs' }
     if (-not $refused) { throw 'different startup timeouts were not refused' }
 
+    # XCL settings are case-sensitive: XCL_DIRECT_DXIL=all enables direct translation, ALL does not.
+    Write-Fixture $baseline 'base-commit' 1000 0
+    Write-Fixture $candidate 'candidate-commit' 850 0
+    $baselineManifest = Get-Content -LiteralPath (Join-Path $baseline 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $baselineManifest.environment | Add-Member -NotePropertyName XCL_DIRECT_DXIL -NotePropertyValue 'all'
+    $candidateManifest.environment | Add-Member -NotePropertyName XCL_DIRECT_DXIL -NotePropertyValue 'ALL'
+    $baselineManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $baseline 'manifest.json') -Encoding utf8
+    $candidateManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'runtime environment differs' }
+    if (-not $refused) { throw 'environments differing only in case were not refused' }
+
     Write-Host 'perf-compare tests: all assertions passed'
 } finally {
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
