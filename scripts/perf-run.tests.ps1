@@ -161,6 +161,44 @@ echo late child write>>"%XCL_DATA_ROOT%\MockTitle\logs\xcl.log"
         throw 'Cargo features/target directory were not passed as canonical arguments'
     }
 
+    # Exercise the producer and comparer together with untouched runner output.
+    $compare = Join-Path $PSScriptRoot 'perf-compare.ps1'
+    $repeatOut = Join-Path $fixture 'repeat-artifacts'
+    $differentOut = Join-Path $fixture 'different-env-artifacts'
+    $runArgs = @{ Game = $game; Seconds = 2; StartupTimeoutSeconds = 30 }
+    try {
+        & (Join-Path $scripts 'perf-run.ps1') @runArgs -OutDir $repeatOut *> $runLog
+        if ($LASTEXITCODE -ne 0) { throw "repeat perf-run.ps1 exited with $LASTEXITCODE" }
+        $env:XCL_PIPELINE_THREADS = '8'
+        & (Join-Path $scripts 'perf-run.ps1') @runArgs -OutDir $differentOut *> $runLog
+        if ($LASTEXITCODE -ne 0) { throw "different-environment perf-run.ps1 exited with $LASTEXITCODE" }
+    } finally {
+        $env:XCL_PIPELINE_THREADS = '1'
+    }
+
+    $manifestPaths = @(@($out, $repeatOut, $differentOut) | ForEach-Object { Join-Path $_ 'manifest.json' })
+    $beforeHashes = @(Get-FileHash -LiteralPath $manifestPaths | ForEach-Object { $_.Hash })
+    $recordedThreads = foreach ($path in $manifestPaths) {
+        $recorded = Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json
+        if ($recorded.workload_id -cne $manifest.workload_id) { throw 'mock run workload IDs differ' }
+        $recorded.environment.XCL_PIPELINE_THREADS
+    }
+    if (($recordedThreads -join ',') -cne '1,1,8') { throw "wrong pipeline thread settings: $recordedThreads" }
+
+    $same = & $compare -Baseline $out -Candidate $repeatOut | ConvertFrom-Json
+    if ($same.schema -cne 'xcl-perf-comparison' -or $same.workload_id -cne $manifest.workload_id) {
+        throw 'matched pipeline thread settings did not produce a comparison for this workload'
+    }
+    try {
+        $null = & $compare -Baseline $out -Candidate $differentOut
+        throw 'different pipeline thread settings were accepted'
+    } catch {
+        if ($_.Exception.Message -cne 'runtime environment differs; runs are incomparable') { throw }
+    }
+    $afterHashes = @(Get-FileHash -LiteralPath $manifestPaths | ForEach-Object { $_.Hash })
+    if (($afterHashes -join ',') -cne ($beforeHashes -join ',')) { throw 'a compared manifest changed' }
+    Write-Host "perf-run/compare: workload $($manifest.workload_id), threads 1/1 accepted, 1/8 refused: runtime environment differs"
+
     $null = New-Item -ItemType Directory -Path $otherGame -Force
     'a different title build with the same folder leaf' | Set-Content -LiteralPath (Join-Path $otherGame 'game-data.bin') -Encoding Ascii
     & (Join-Path $scripts 'perf-run.ps1') -Game $otherGame -OutDir $otherOut -Seconds 2
