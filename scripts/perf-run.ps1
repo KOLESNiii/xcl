@@ -172,6 +172,64 @@ function Video-Driver([string]$Adapter) {
     }
 }
 
+# A job object that kills its processes when terminated or closed, so a run's whole process tree
+# ends with it.
+if (-not ('XclPerfRun.KillOnCloseJob' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace XclPerfRun {
+    public sealed class KillOnCloseJob : IDisposable {
+        [StructLayout(LayoutKind.Sequential)]
+        struct BasicLimitInformation {
+            public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass, SchedulingClass;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct ExtendedLimitInformation {
+            public BasicLimitInformation Basic;
+            public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+            public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+            public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+        }
+        const int ExtendedLimitInformationClass = 9;
+        const uint KillOnJobClose = 0x2000;
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateJobObjectW(IntPtr attributes, IntPtr name);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimitInformation info, int length);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+        IntPtr handle;
+        public KillOnCloseJob() {
+            handle = CreateJobObjectW(IntPtr.Zero, IntPtr.Zero);
+            if (handle == IntPtr.Zero) throw new Win32Exception();
+            var info = new ExtendedLimitInformation();
+            info.Basic.LimitFlags = KillOnJobClose;
+            if (!SetInformationJobObject(handle, ExtendedLimitInformationClass, ref info, Marshal.SizeOf(typeof(ExtendedLimitInformation)))) {
+                var error = new Win32Exception();
+                Dispose();
+                throw error;
+            }
+        }
+        public void Add(IntPtr process) {
+            if (!AssignProcessToJobObject(handle, process)) throw new Win32Exception();
+        }
+        public void Terminate() {
+            if (!TerminateJobObject(handle, 1)) throw new Win32Exception();
+        }
+        public void Dispose() {
+            if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
+        }
+    }
+}
+'@
+}
+
 function Invoke-PerfRun([string]$Mode, [int]$Order) {
     $runName = '{0:d2}-{1}' -f $Order, $Mode
     $artifactDir = Join-Path (Join-Path $outPath 'runs') $runName
@@ -197,14 +255,27 @@ function Invoke-PerfRun([string]$Mode, [int]$Order) {
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $psi
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-    $null = $process.Start()
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
-    $timedOut = -not $process.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)
-    if ($timedOut -and -not $process.HasExited) { $process.Kill() }
-    $process.WaitForExit()
-    $watch.Stop()
+    $job = New-Object XclPerfRun.KillOnCloseJob
+    try {
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $null = $process.Start()
+        $job.Add($process.Handle)
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $timedOut = -not $process.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)
+        # Ends the launcher and everything it started, so that no process left behind keeps
+        # writing the run's log or holds its output pipes open after the run is timed.
+        $job.Terminate()
+        $process.WaitForExit()
+        $watch.Stop()
+    } finally {
+        $job.Dispose()
+    }
+    # A process that escaped the job (started before the launcher was assigned to it) could still
+    # hold the pipes; do not wait for it indefinitely.
+    if (-not $stdoutTask.Wait(30000) -or -not $stderrTask.Wait(30000)) {
+        throw "the $Mode run's output was still open 30 s after XCL ended"
+    }
     $stdout = $stdoutTask.Result
     $stderr = $stderrTask.Result
 

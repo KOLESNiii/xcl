@@ -64,8 +64,17 @@ exit /b -1073741819
 :no_crash
 echo {"d3d12":{"adapter":"Mock GPU","submissions":2,"slowest_submission_ms":1.5,"slowest_submission_lists":3}}>"%XCL_DATA_ROOT%\MockTitle\logs\report.json"
 echo Log: %XCL_DATA_ROOT%\MockTitle\logs\xcl.log
+if not "%MOCK_XCL_LINGER%"=="1" exit /b 0
+start "" /b cmd /d /c ""%~dp0mock-child.cmd""
+ping -n 11 127.0.0.1 >nul
 exit /b 0
 '@ | Set-Content -LiteralPath $mockXcl -Encoding Ascii
+    # Started by the mock and sharing its output: writes the log 5 s later unless it is ended.
+    @'
+@echo off
+ping -n 6 127.0.0.1 >nul
+echo late child write>>"%XCL_DATA_ROOT%\MockTitle\logs\xcl.log"
+'@ | Set-Content -LiteralPath (Join-Path $bin 'mock-child.cmd') -Encoding Ascii
 
     & git.exe -C $repo init | Out-Null
     & git.exe -C $repo add .
@@ -169,6 +178,25 @@ exit /b 0
     $crashManifest = Get-Content -LiteralPath (Join-Path $crashOut 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     if ($crashManifest.runs[0].exit_code -ne -1073741819 -or $null -ne $crashManifest.runs[0].artifacts.report) { throw 'a crashed run was not recorded with its exit code and without a report' }
     if ((Get-Content -LiteralPath (Join-Path $crashOut 'runs\01-cold\xcl.log') -Raw) -notmatch 'cache=cold') { throw 'the crashed run''s log was not kept' }
+
+    # A timeout ends the whole process tree: a child of the launcher does not outlive the run,
+    # keep its output open or write the log after the run's time is taken.
+    $lingerOut = Join-Path $fixture 'linger-artifacts'
+    $env:MOCK_XCL_LINGER = '1'
+    try {
+        & (Join-Path $scripts 'perf-run.ps1') -Game $game -OutDir $lingerOut -Seconds 1 -StartupTimeoutSeconds 1 *> $runLog
+    } finally {
+        Remove-Item Env:MOCK_XCL_LINGER -ErrorAction SilentlyContinue
+    }
+    $lingerManifest = Get-Content -LiteralPath (Join-Path $lingerOut 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    foreach ($run in $lingerManifest.runs) {
+        if (-not $run.timed_out -or $run.duration_actual_ms -ge 4000) { throw "a timed-out run was not ended at its deadline: $($run.duration_actual_ms) ms" }
+    }
+    foreach ($runName in @('01-cold', '02-warm')) {
+        if ((Get-Content -LiteralPath (Join-Path $lingerOut "runs\$runName\xcl.log") -Raw) -match 'late child write') {
+            throw "a process left by the $runName run wrote its log after the timeout"
+        }
+    }
 
     Add-Content -LiteralPath (Join-Path $repo '.gitignore') -Value '# dirty'
     $refused = $false
