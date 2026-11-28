@@ -848,14 +848,25 @@ impl State {
         if target == 0 || self.fence.GetCompletedValue() >= target {
             return true;
         }
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
         let _ = self.fence.SetEventOnCompletion(target, self.event);
         let ms = wait_ms();
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, ms);
-        let reached = self.fence.GetCompletedValue() >= target;
-        if !reached {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after {} s (at {})", ms as f64 / 1000.0, self.fence.GetCompletedValue());
+        let start = std::time::Instant::now();
+        // The event is shared and auto-reset: a wake can be left over from an earlier wait
+        // that gave up (its value was reached later). So the fence is checked after every wake,
+        // and the wait goes on against the same deadline until `target` is reached.
+        loop {
+            let left = ms.saturating_sub(start.elapsed().as_millis().min(u32::MAX as u128) as u32);
+            let woke = windows::Win32::System::Threading::WaitForSingleObject(self.event, left) == WAIT_OBJECT_0;
+            if self.fence.GetCompletedValue() >= target {
+                return true;
+            }
+            if !woke || left == 0 {
+                break;
+            }
         }
-        reached
+        crate::xlog_warn!("sparse: the queue has not reached fence value {target} after {:.3} s (at {})", start.elapsed().as_secs_f64(), self.fence.GetCompletedValue());
+        false
     }
 
     /// `alloc` and `list`, last submitted at fence value `fv`, which a bounded wait gave up on:
@@ -2448,6 +2459,38 @@ mod tests {
             s.reclaim_ring();
             assert!(s.held_lists.is_empty(), "a held pair goes once the queue has passed its submission");
             drop(unblock);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A wake left on the shared event by an earlier wait that gave up does not end the next
+    /// wait: it goes on until its own value is reached, within the same bound.
+    #[test]
+    fn a_stale_wake_does_not_end_the_next_wait() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            s.wait_for(s.value);
+            let (old, new) = (s.value + 1, s.value + 2);
+            s.value = new;
+            // an earlier wait registered `old` and gave up; `old` is reached afterwards
+            s.fence.SetEventOnCompletion(old, s.event).expect("register the earlier wait");
+            s.fence.Signal(old).expect("reach the earlier value");
+            let fence = s.fence.clone();
+            let later = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                fence.Signal(new).expect("reach the new value");
+            });
+            WAIT_MS.with(|w| w.set(Some(2000)));
+            let t = std::time::Instant::now();
+            let reached = s.wait_for(new);
+            WAIT_MS.with(|w| w.set(None));
+            let waited = t.elapsed();
+            later.join().expect("signalling thread");
+            assert!(reached, "the wait ended on a stale wake after {waited:?} (fence at {})", s.fence.GetCompletedValue());
+            assert!(waited >= std::time::Duration::from_millis(10), "the wait ended before the value was signalled ({waited:?})");
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
