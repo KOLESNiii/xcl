@@ -15,6 +15,12 @@ pub(super) struct LaunchOptions {
     pub budget: Duration,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct HistorySelection {
+    pub compute: Vec<u64>,
+    pub graphics: Vec<u64>,
+}
+
 pub(super) fn launch_options(cutoff: Option<&str>, seconds: Option<&str>) -> Result<Option<LaunchOptions>, String> {
     let Some(cutoff) = cutoff else { return Ok(None) };
     let cutoff = cutoff.trim().parse::<u64>().ok().filter(|&n| n != 0)
@@ -24,14 +30,14 @@ pub(super) fn launch_options(cutoff: Option<&str>, seconds: Option<&str>) -> Res
     Ok(Some(LaunchOptions { cutoff, budget: Duration::from_secs(seconds) }))
 }
 
-fn compute_prefix(reader: impl BufRead, cutoff: u64) -> Result<Vec<u64>, String> {
+fn history_prefix(reader: impl BufRead, cutoff: u64) -> Result<HistorySelection, String> {
     let mut lines = reader.lines();
     let header = lines.next().transpose().map_err(|e| e.to_string())?.unwrap_or_default();
     if !header.starts_with(HEADER) {
         return Err("expected an XCL PSO manifest v1 header".into());
     }
-    let mut keys = Vec::new();
-    let mut seen = HashSet::new();
+    let (mut compute, mut graphics) = (Vec::new(), Vec::new());
+    let (mut seen_compute, mut seen_graphics) = (HashSet::new(), HashSet::new());
     for (seq, row) in lines.enumerate() {
         let row = row.map_err(|e| e.to_string())?;
         let fields: Vec<_> = row.split('\t').collect();
@@ -41,24 +47,46 @@ fn compute_prefix(reader: impl BufRead, cutoff: u64) -> Result<Vec<u64>, String>
             return Err(invalid());
         }
         match fields[2..] {
-            ["use", key, kind @ ("compute" | "graphics"), "ready" | "cold"] |
-            ["use", key, kind @ ("compute" | "graphics"), "ready" | "cold", _] => {
+            ["use", key, kind @ ("compute" | "graphics"), "ready" | "cold"] => {
                 if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(invalid());
                 }
                 let key = u64::from_str_radix(key, 16).map_err(|_| invalid())?;
-                if kind == "compute" && seen.insert(key) {
-                    if keys.len() == MAX_PIPELINES {
+                if kind == "compute" && seen_compute.insert(key) {
+                    if compute.len() + graphics.len() == MAX_PIPELINES {
                         return Err(format!("manifest prefix exceeds the {MAX_PIPELINES}-pipeline startup limit"));
                     }
-                    keys.push(key);
+                    compute.push(key);
+                }
+            }
+            ["use", key, kind @ ("compute" | "graphics"), "ready" | "cold", recipe] => {
+                if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(invalid());
+                }
+                let key = u64::from_str_radix(key, 16).map_err(|_| invalid())?;
+                let recipe = match recipe {
+                    "-" => None,
+                    value if value.len() == 16 && value.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                        Some(u64::from_str_radix(value, 16).map_err(|_| invalid())?),
+                    _ => return Err(invalid()),
+                };
+                if kind == "compute" && seen_compute.insert(key) {
+                    if compute.len() + graphics.len() == MAX_PIPELINES {
+                        return Err(format!("manifest prefix exceeds the {MAX_PIPELINES}-pipeline startup limit"));
+                    }
+                    compute.push(key);
+                } else if kind == "graphics" && recipe.is_some_and(|recipe| seen_graphics.insert(recipe)) {
+                    if compute.len() + graphics.len() == MAX_PIPELINES {
+                        return Err(format!("manifest prefix exceeds the {MAX_PIPELINES}-pipeline startup limit"));
+                    }
+                    graphics.push(recipe.unwrap());
                 }
             }
             ["build", _, _, _, _, _, _] => {}
             ["present", n] => {
                 let n = n.parse::<u64>().map_err(|_| invalid())?;
                 if n == cutoff {
-                    return Ok(keys);
+                    return Ok(HistorySelection { compute, graphics });
                 }
                 if n > cutoff {
                     break;
@@ -70,6 +98,17 @@ fn compute_prefix(reader: impl BufRead, cutoff: u64) -> Result<Vec<u64>, String>
     Err(format!("manifest has no recorded present {cutoff}"))
 }
 
+#[cfg(test)]
+fn compute_prefix(reader: impl BufRead, cutoff: u64) -> Result<Vec<u64>, String> {
+    Ok(history_prefix(reader, cutoff)?.compute)
+}
+
+pub(super) fn history_selection(manifest: &Path, cutoff: u64) -> Result<HistorySelection, String> {
+    let file = std::fs::File::open(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
+    history_prefix(BufReader::new(file), cutoff)
+}
+
+#[cfg(test)]
 fn record_indices(input: &Input, keys: &[u64]) -> Result<Vec<usize>, String> {
     Ok(record_locations(std::slice::from_ref(input), keys)?.into_iter().map(|(_, index)| index).collect())
 }
@@ -96,25 +135,19 @@ fn record_locations(inputs: &[Input], keys: &[u64]) -> Result<Vec<(usize, usize)
     Ok(keys.iter().map(|key| found[key]).collect())
 }
 
-fn selected_records(inputs: &[Input], manifest: &Path, cutoff: u64) -> Result<Vec<(u64, usize, usize)>, String> {
-    let file = std::fs::File::open(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
-    let keys = compute_prefix(BufReader::new(file), cutoff)?;
+fn selected_records(inputs: &[Input], keys: Vec<u64>) -> Result<Vec<(u64, usize, usize)>, String> {
     let locations = record_locations(inputs, &keys)?;
     Ok(keys.into_iter().zip(locations).map(|(key, (input, index))| (key, input, index)).collect())
 }
 
 pub(super) fn prepare_launch(
-    inputs: &[Input], manifest: &Path, options: &LaunchOptions, windows: u32,
-    adapter: &str, progress: &super::LaunchPreparation,
+    inputs: &[Input], keys: Vec<u64>, options: &LaunchOptions, windows: u32,
+    adapter: &str, progress: &super::LaunchPreparation, began: Instant,
 ) -> Result<(), String> {
-    let selected = selected_records(inputs, manifest, options.cutoff)?;
-    progress.done.store(0, Ordering::Relaxed);
-    progress.total.store(selected.len(), Ordering::Relaxed);
-    progress.workers.store(1, Ordering::Relaxed);
+    let selected = selected_records(inputs, keys)?;
     if selected.is_empty() { return Ok(()) }
     let mut pipelines = Pipelines::for_adapter(adapter)?;
     pipelines.warm_blobs = super::warm_blobs::Verified::for_device(&pipelines.dev);
-    let began = Instant::now();
     for (key, input, index) in selected.iter().copied() {
         if progress.cancel.load(Ordering::Relaxed) { return Err("Pipeline preparation cancelled".into()) }
         if began.elapsed() >= options.budget {
@@ -141,7 +174,7 @@ pub(super) fn prepare_launch(
 }
 
 pub(super) fn run(input: &Input, manifest: &Path, cutoff: u64, windows: u32, split: Option<bool>) -> Result<(), String> {
-    let selected = selected_records(std::slice::from_ref(input), manifest, cutoff)?;
+    let selected = selected_records(std::slice::from_ref(input), history_selection(manifest, cutoff)?.compute)?;
     println!("present {cutoff}: {} compute pipelines in first-use order", selected.len());
     if selected.is_empty() {
         return Ok(());
@@ -183,6 +216,19 @@ mod tests {
         let exact = format!("{HEADER}seq\n0\t0\tuse\t0000000000000009\tcompute\tcold\t0000000000000042\n1\t0\tpresent\t1\n");
         assert_eq!(compute_prefix(exact.as_bytes(), 1).unwrap(), [9]);
         assert!(compute_prefix(EVENTS.as_bytes(), 4).unwrap_err().contains("no recorded present 4"));
+    }
+
+    #[test]
+    fn selects_exact_graphics_recipes_and_ignores_legacy_ambiguous_ones() {
+        let events = format!(
+            "{HEADER}seq\n0\t0\tuse\t0000000000000001\tgraphics\tcold\n1\t0\tuse\t0000000000000001\tgraphics\tcold\t00000000000000a1\n2\t0\tuse\t0000000000000002\tcompute\tready\t-\n3\t0\tuse\t0000000000000003\tgraphics\tready\t00000000000000a1\n4\t0\tuse\t0000000000000003\tgraphics\tready\t00000000000000a2\n5\t0\tpresent\t1\n"
+        );
+        assert_eq!(
+            history_prefix(events.as_bytes(), 1).unwrap(),
+            HistorySelection { compute: vec![2], graphics: vec![0xa1, 0xa2] }
+        );
+        let malformed = format!("{HEADER}seq\n0\t0\tuse\t0000000000000001\tgraphics\tcold\tnot-a-recipe\n1\t0\tpresent\t1\n");
+        assert!(history_prefix(malformed.as_bytes(), 1).is_err());
     }
 
     #[test]
