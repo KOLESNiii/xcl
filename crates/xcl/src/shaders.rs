@@ -35,6 +35,7 @@ fn warm_settings(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::O
             "XCL_PRECOMPILE_PARENT" | "XCL_PREPARATION_PARENT" | "XCL_PREPARATION_MENU" |
             "XCL_PRECOMPILE_SLICE" | "XCL_PRECOMPILE_COVERAGE_MAP" | "XCL_PRECOMPILE_COVERAGE_DIR" |
             "XCL_DXC_THREADS" | "XCL_PIPELINE_THREADS" | "XCL_PREPARE_WORKERS" | "XCL_PIPELINE_LIBRARY_OUT" | "XCL_PREPARE" |
+            "XCL_PREPARE_HISTORY_PRESENT" | "XCL_PREPARE_HISTORY_SECONDS" |
             "XCL_PREPARE_GRAPHICS" | "XCL_PREPARE_ALL_LIVE" | "XCL_RUN_SECONDS" | "XCL_PRESS_AT" |
             "XCL_PRESS_AFTER_POLL" | "XCL_ACTIVITY" | "XCL_SKIP_BINK" | "XCL_FRAME_DUMP" |
             "XCL_FRAME_DUMP_FULL" | "XCL_GPU_CULPRIT" | "XCL_DSTORAGE_LATE_PAGE_MS" | "XCL_DISPATCH_TILE_AXIS") {
@@ -2639,6 +2640,25 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
         }
     }
     let corpus = pso_corpus::discover(root)?;
+    let cutoff = std::env::var("XCL_PREPARE_HISTORY_PRESENT").ok();
+    let seconds = std::env::var("XCL_PREPARE_HISTORY_SECONDS").ok();
+    if let Some(options) = milestone::launch_options(cutoff.as_deref(), seconds.as_deref())? {
+        let inputs = title_inputs(root)?;
+        if inputs.is_empty() { return Err("No shader records are available for history preparation".into()) }
+        let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
+        if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
+        let manifest = crate::gpu::recomp::dxc::cache_dir().join("pso-manifest.txt");
+        let selected = milestone::history_selection(&manifest, options.cutoff)?;
+        progress.done.store(0, Ordering::Relaxed);
+        progress.total.store(selected.compute.len() + selected.graphics.len(), Ordering::Relaxed);
+        progress.workers.store(1, Ordering::Relaxed);
+        let began = std::time::Instant::now();
+        let mut timing = milestone::HistoryTiming::new(began, options.budget);
+        milestone::prepare_launch(&inputs, selected.compute, &options, windows, &progress.adapter, progress, began, &mut timing)?;
+        prepare_history_graphics(&inputs, selected.graphics, windows, &progress.adapter, progress, began, options.budget, &mut timing)?;
+        timing.finish();
+        return Ok(());
+    }
     prepare_title_inputs(root, progress, corpus.as_ref())?;
     if let Some(corpus) = corpus {
         corpus.prepare(progress)?;
@@ -2647,7 +2667,7 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     Ok(())
 }
 
-fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Option<&pso_corpus::Corpus>) -> Result<(), String> {
+fn title_inputs(root: &Path) -> Result<Vec<Input>, String> {
     let mut inputs = Vec::new();
     let pack = root.join("shaders.rpf");
     if pack.try_exists().map_err(|e| e.to_string())? {
@@ -2663,6 +2683,12 @@ fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Optio
         loose_inputs(&loose, &mut files).map_err(|e| format!("Reading {}: {e}", loose.display()))?;
         if !files.is_empty() { inputs.push(Input::Files(files)); }
     }
+    Ok(inputs)
+}
+
+fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Option<&pso_corpus::Corpus>) -> Result<(), String> {
+    let inputs = title_inputs(root)?;
+    let pack = root.join("shaders.rpf");
     progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
     let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
     if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
@@ -2914,6 +2940,81 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
 /// one process, and a driver that ends a worker ends no title. Their shaders come from the title's
 /// shader files (`inputs`) by key, as those of `used-shaders.txt`; each worker gets a file of its
 /// part (`gfx_records`' format, with the shaders it needs). A worker must confirm every recipe.
+fn exact_graphics_records(
+    recipe_ids: &[u64], payloads: impl IntoIterator<Item = Vec<u8>>,
+) -> Result<Vec<GraphicsHistoryRecord>, String> {
+    let wanted: HashSet<_> = recipe_ids.iter().copied().collect();
+    let mut found = HashMap::new();
+    for payload in payloads {
+        let id = gfx_records::payload_key(&payload);
+        if !wanted.contains(&id) || found.contains_key(&id) { continue; }
+        let entry = gfx_records::decode(&payload).ok_or_else(|| format!("Unrecognized graphics history recipe {id:016x}"))?;
+        if let Some(record) = GraphicsHistoryRecord::from_entry(entry) { found.insert(id, record); }
+    }
+    let missing: Vec<_> = recipe_ids.iter().filter(|id| !found.contains_key(id)).map(|id| format!("{id:016x}")).collect();
+    if !missing.is_empty() {
+        return Err(format!("Missing exact graphics history recipes ({}): {}", missing.len(), missing.join(", ")));
+    }
+    Ok(recipe_ids.iter().map(|id| found.remove(id).unwrap()).collect())
+}
+
+fn prepare_history_graphics(
+    inputs: &[Input], recipe_ids: Vec<u64>, windows: u32, adapter: &str,
+    progress: &LaunchPreparation, began: std::time::Instant, budget: std::time::Duration,
+    timing: &mut milestone::HistoryTiming,
+) -> Result<(), String> {
+    if recipe_ids.is_empty() || began.elapsed() >= budget { return Ok(()) }
+    let mut payloads = Vec::new();
+    for path in [gfx_records::path(), gfx_records::shared_history_path()] {
+        if !path.try_exists().map_err(|e| e.to_string())? { continue; }
+        payloads.extend(gfx_records::read_history_payloads(&path)?);
+    }
+    let records = exact_graphics_records(&recipe_ids, payloads)?;
+    let shader_keys: HashSet<_> = records.iter().flat_map(|record| record.identity().1.iter().copied())
+        .filter(|key| *key != 0).collect();
+    let shaders = shaders_by_key(inputs, shader_keys, progress);
+    let (ready, missing) = buildable(records.iter(), &shaders);
+    if missing != 0 || ready.len() != records.len() {
+        return Err(format!("{missing} exact graphics history recipes have missing or mismatched shaders"));
+    }
+    recomp::pso::set_title_windows(windows);
+    recomp::dxc::set_memory_reserve(2);
+    let cache_before = crate::hle::d3d12x::real::driver_cache_stats();
+    let pipelines = Pipelines::for_adapter(adapter)?;
+    let device = crate::hle::d3d12x::real::prepare_device(pipelines.dev.clone());
+    let mut confirmed = 0usize;
+    for (recipe_id, record) in recipe_ids.iter().copied().zip(&records) {
+        if progress.cancel.load(Ordering::Relaxed) { return Err("Pipeline preparation cancelled".into()) }
+        if began.elapsed() >= budget { break }
+        let code = |key| shaders.get(&key).map(Vec::as_slice);
+        let kind = if matches!(record, GraphicsHistoryRecord::Mesh(_)) { "mesh" } else { "graphics" };
+        let started = std::time::Instant::now();
+        let ok = unsafe { match record {
+            GraphicsHistoryRecord::Legacy(record) => {
+                let desc = record.desc(record.shaders.map(code));
+                crate::hle::d3d12x::real::prepare_graphics(device, &desc, record.depth_bounds)
+            }
+            GraphicsHistoryRecord::Mesh(record) =>
+                crate::hle::d3d12x::real::replay_mesh_record(device, record, record.shaders.map(code)).is_ok(),
+        }};
+        timing.record(kind, recipe_id, started.elapsed());
+        if !ok { return Err(format!("Graphics history recipe {:016x} failed", record.identity().0)) }
+        confirmed += 1;
+        progress.done.fetch_add(1, Ordering::Relaxed);
+    }
+    crate::xlog_info!(
+        "History preparation: {confirmed} of {} exact graphics pipelines confirmed through the launch milestone in {:.1} s",
+        records.len(), began.elapsed().as_secs_f64()
+    );
+    let cache_after = crate::hle::d3d12x::real::driver_cache_stats();
+    crate::xlog_info!(
+        "History preparation graphics cache outcomes: {} driver-blob hits, {} rejected blobs, {} new blobs",
+        cache_after.0.saturating_sub(cache_before.0), cache_after.1.saturating_sub(cache_before.1),
+        cache_after.2.saturating_sub(cache_before.2)
+    );
+    Ok(())
+}
+
 fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress: &LaunchPreparation, staged_graphics: Option<&Path>) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let path = gfx_records::path();
@@ -3992,6 +4093,27 @@ mod tests {
         ];
         let shaders = HashMap::from([(shader_key(&vs), vs), (shader_key(&ps), ps), (shader_key(&ms), ms)]);
         assert_eq!(buildable(records.iter(), &shaders), (vec![0, 1, 4], 3));
+    }
+
+    #[test]
+    fn exact_graphics_history_selection_preserves_manifest_order() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+        let payload = |mask| unsafe {
+            gfx_records::encode(
+                7, [7, 0, 0, 0, 0],
+                &D3D12_GRAPHICS_PIPELINE_STATE_DESC { SampleMask: mask, ..Default::default() },
+            )
+        };
+        let first = payload(1);
+        let second = payload(2);
+        let ids = [gfx_records::payload_key(&second), gfx_records::payload_key(&first)];
+        let selected = exact_graphics_records(&ids, vec![first, second, vec![0xff]]).unwrap();
+        assert_eq!(selected.iter().map(|record| match record {
+            GraphicsHistoryRecord::Legacy(record) => record.desc([None; 5]).SampleMask,
+            GraphicsHistoryRecord::Mesh(_) => 0,
+        }).collect::<Vec<_>>(), [2, 1]);
+        let Err(error) = exact_graphics_records(&[3], Vec::new()) else { panic!("missing recipe accepted") };
+        assert!(error.contains("0000000000000003"));
     }
 
     #[test]

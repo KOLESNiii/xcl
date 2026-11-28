@@ -8511,7 +8511,7 @@ unsafe fn go_background(
     }
     if lazy {
         if let Some(entry) = described {
-            super::pso_async::on_first_use(*ppv as usize, Box::new(move || super::gfx_records::note(entry)));
+            super::pso_async::on_first_use_graphics(*ppv as usize, entry);
         }
     }
     if driver != 0 {

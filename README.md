@@ -281,6 +281,11 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   launch when the null renderer is selected. For an unstaged title set `XCL_PREPARE=0`
   to skip startup preparation, or `XCL_PREPARE_GRAPHICS=0` to skip optional graphics history.
   Under Series S (`lockhart`) the usage manifests and graphics history use `-lockhart` file names.
+  `XCL_PREPARE_HISTORY_PRESENT=N` instead prepares at most 500 compute and exact graphics/mesh
+  pipelines used through present `N` in the previous `XCL_PSO_MANIFEST=1` recording. Graphics
+  recipes need a recording made by a build that writes their exact identity; older recordings
+  still select compute pipelines. XCL checks the time budget between pipelines
+  (`XCL_PREPARE_HISTORY_SECONDS`, 15 by default); one driver call cannot be interrupted.
   Native recipes validated on this adapter and driver reuse their verified blobs across
   rebuilds. Compute verification also survives changes to the preparation worker count.
   Changes to translation, pipeline layout, settings or cache files trigger validation. During

@@ -100,6 +100,8 @@ struct Pending {
     compute: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
+    /// Exact serialized graphics/mesh recipe identity for the first-use manifest; 0 = none.
+    manifest_recipe: AtomicU64,
     track_used: bool,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
@@ -701,6 +703,7 @@ impl Pending {
             key: self.key,
             compute: self.compute,
             ready: self.build.real.load(Ordering::Acquire) != 0,
+            recipe: match self.manifest_recipe.load(Ordering::Acquire) { 0 => None, key => Some(key) },
         };
         if self.key != 0 && super::pso_manifest::note_first(&self.used, event) {
             if self.track_used {
@@ -4508,6 +4511,7 @@ fn submit_as(
         driver: AtomicUsize::new(0),
         compute,
         key,
+        manifest_recipe: AtomicU64::new(0),
         track_used: !send,
         used: Default::default(),
         late: Default::default(),
@@ -4544,9 +4548,18 @@ pub type OnUse = Box<dyn FnOnce() + Send>;
 /// What the first use of lazy pipeline `standin` tells besides `used::note`: a graphics one's
 /// description for the next run's preparation (`gfx_records::note`). Told before the title has
 /// the stand-in.
+#[cfg(test)]
 pub(super) fn on_first_use(standin: usize, f: OnUse) {
     if let Some(p) = entry(standin) {
         *p.on_use.lock().unwrap() = Some(f);
+    }
+}
+
+/// Attach the exact graphics recipe before the title can first use the returned stand-in.
+pub(super) fn on_first_use_graphics(standin: usize, payload: Vec<u8>) {
+    if let Some(p) = entry(standin) {
+        p.manifest_recipe.store(super::gfx_records::payload_key(&payload), Ordering::Release);
+        *p.on_use.lock().unwrap() = Some(Box::new(move || super::gfx_records::note(payload)));
     }
 }
 
@@ -5944,6 +5957,7 @@ mod used_tests {
             driver: AtomicUsize::new(0),
             compute,
             key: 0,
+            manifest_recipe: AtomicU64::new(0),
             track_used: true,
             used: AtomicBool::new(false),
             late: AtomicBool::new(false),
@@ -8083,6 +8097,7 @@ mod used_tests {
         // Ordinary/default resolution bookkeeping does not touch the opt-in candidate journal.
         let pending = Pending {
             build: first_build.clone(), driver: AtomicUsize::new(0), compute: false, key: 0,
+            manifest_recipe: AtomicU64::new(0),
             track_used: true,
             used: AtomicBool::new(false), late: AtomicBool::new(false), spared: AtomicBool::new(false),
             on_use: Mutex::new(None),
@@ -10089,6 +10104,18 @@ mod used_tests {
         released(standin);
     }
 
+    #[test]
+    fn graphics_first_use_carries_the_exact_serialized_recipe_identity() {
+        let standin = 0x7E57_7013usize;
+        let payload = b"canonical graphics recipe".to_vec();
+        submit_lazy(standin, false, Box::new(|| 0x4332), 0x5EED_0013);
+        on_first_use_graphics(standin, payload.clone());
+        let pending = entry(standin).unwrap();
+        assert_eq!(pending.manifest_recipe.load(Ordering::Acquire), super::super::gfx_records::payload_key(&payload));
+        assert!(pending.on_use.lock().unwrap().is_some());
+        released(standin);
+    }
+
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
 
     /// Normal workers parked at the huge-driver-compile gate leave their priority band live, and
@@ -10590,6 +10617,7 @@ mod used_tests {
             driver: AtomicUsize::new(0),
             compute: false,
             key: 0x5EED_C0DE,
+            manifest_recipe: AtomicU64::new(0),
             track_used: true,
             used: Default::default(),
             late: Default::default(),
@@ -11958,6 +11986,7 @@ fn pipeline_resolution_for_kind_test(
         driver: AtomicUsize::new(0),
         compute,
         key: 0,
+        manifest_recipe: AtomicU64::new(0),
         track_used: true,
         used: AtomicBool::new(false),
         late: AtomicBool::new(false),

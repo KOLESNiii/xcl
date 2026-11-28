@@ -4,7 +4,8 @@
 //! point of its start, in the order it needs them, and which of them it had to wait for.
 //!
 //! - `use`: a pipeline's first use (its first bind or draw), with its shader-set key, compute
-//!   or graphics, and whether it was built by then (`ready`) or not (`cold`).
+//!   or graphics, whether it was built by then (`ready`) or not (`cold`), and an exact graphics
+//!   recipe identity when one is available.
 //! - `build`: a driver compile of a pipeline (`driver_compile`): kind, DXIL bytes, the console
 //!   record's hash when known, whether a driver blob was supplied, time in the driver and time
 //!   spent waiting for a compile slot. It is written when the driver call returns, so a
@@ -25,7 +26,7 @@ use std::time::Instant;
 /// One manifest event.
 #[derive(Clone, Copy, Debug)]
 pub enum Event<'a> {
-    Use { key: u64, compute: bool, ready: bool },
+    Use { key: u64, compute: bool, ready: bool, recipe: Option<u64> },
     Build { kind: &'a str, bytes: usize, record: Option<u64>, cached: bool, driver_ms: u128, waited_ms: u128 },
     Present { n: u64 },
 }
@@ -53,7 +54,7 @@ pub(super) fn note_ready_compute(pso: usize) {
     if enabled() {
         let mut pipelines = READY_COMPUTE.lock().unwrap();
         if let Some(entry) = pipelines.as_mut().and_then(|keys| keys.remove(&pso)) {
-            note(Event::Use { key: entry.key, compute: true, ready: true });
+            note(Event::Use { key: entry.key, compute: true, ready: true, recipe: None });
         }
     }
 }
@@ -72,13 +73,14 @@ pub fn enabled() -> bool {
 }
 
 /// The header line: the columns of each event kind.
-pub const HEADER: &str = "# xcl pso manifest v1: seq\tms\tuse\tkey\tcompute|graphics\tready|cold | seq\tms\tbuild\tkind\tdxil_bytes\trecord|-\tblob|cold\tdriver_ms\twaited_ms | seq\tms\tpresent\tn";
+pub const HEADER: &str = "# xcl pso manifest v1: seq\tms\tuse\tkey\tcompute|graphics\tready|cold\trecipe|- | seq\tms\tbuild\tkind\tdxil_bytes\trecord|-\tblob|cold\tdriver_ms\twaited_ms | seq\tms\tpresent\tn";
 
 /// The manifest line of event `seq` at `ms` (without the newline).
 pub fn line(seq: u64, ms: u128, e: &Event) -> String {
     match *e {
-        Event::Use { key, compute, ready } => {
-            format!("{seq}\t{ms}\tuse\t{key:016x}\t{}\t{}", if compute { "compute" } else { "graphics" }, if ready { "ready" } else { "cold" })
+        Event::Use { key, compute, ready, recipe } => {
+            let recipe = recipe.map_or_else(|| "-".to_string(), |hash| format!("{hash:016x}"));
+            format!("{seq}\t{ms}\tuse\t{key:016x}\t{}\t{}\t{recipe}", if compute { "compute" } else { "graphics" }, if ready { "ready" } else { "cold" })
         }
         Event::Build { kind, bytes, record, cached, driver_ms, waited_ms } => {
             let rec = record.map_or_else(|| "-".to_string(), |hash| format!("{hash:016x}"));
@@ -211,7 +213,7 @@ mod tests {
                     let (used, go) = (used.clone(), go.clone());
                     std::thread::spawn(move || {
                         go.wait();
-                        if !note_first_on(&used, Event::Use { key, compute: true, ready: false }) {
+                        if !note_first_on(&used, Event::Use { key, compute: true, ready: false, recipe: None }) {
                             // the losing bind goes on and the title presents
                             let m = get();
                             let mut f = m.file.lock().unwrap();
@@ -233,8 +235,8 @@ mod tests {
 
     #[test]
     fn manifest_lines_have_one_column_layout_per_event() {
-        assert_eq!(line(0, 5, &Event::Use { key: 0xAB, compute: true, ready: false }), "0\t5\tuse\t00000000000000ab\tcompute\tcold");
-        assert_eq!(line(1, 6, &Event::Use { key: 1, compute: false, ready: true }), "1\t6\tuse\t0000000000000001\tgraphics\tready");
+        assert_eq!(line(0, 5, &Event::Use { key: 0xAB, compute: true, ready: false, recipe: None }), "0\t5\tuse\t00000000000000ab\tcompute\tcold\t-");
+        assert_eq!(line(1, 6, &Event::Use { key: 1, compute: false, ready: true, recipe: Some(2) }), "1\t6\tuse\t0000000000000001\tgraphics\tready\t0000000000000002");
         assert_eq!(
             line(2, 700, &Event::Build { kind: "compute", bytes: 404008, record: Some(0x7b13a0cd15b6edf9), cached: false, driver_ms: 3266, waited_ms: 37588 }),
             "2\t700\tbuild\tcompute\t404008\t7b13a0cd15b6edf9\tcold\t3266\t37588"
@@ -244,7 +246,7 @@ mod tests {
         assert_eq!(line(5, 900, &Event::Present { n: 64 }), "5\t900\tpresent\t64");
         // every event kind's line has as many columns as its part of the header names
         let header: Vec<usize> = HEADER.trim_start_matches("# xcl pso manifest v1: ").split(" | ").map(|p| p.split('\t').count()).collect();
-        assert_eq!(header, vec![6, 9, 4]);
+        assert_eq!(header, vec![7, 9, 4]);
     }
 
     #[test]

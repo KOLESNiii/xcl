@@ -447,7 +447,7 @@ fn synchronous_compute_manifest_records_first_bind() {
     let events: Vec<_> = manifest.lines().skip(1).collect();
     assert_eq!(events.len(), 2, "{manifest}");
     assert!(events[0].contains("\tbuild\tcompute\t"), "{manifest}");
-    assert!(events[1].ends_with("\tuse\tb3b2fd750cde2d8d\tcompute\tready"), "{manifest}");
+    assert!(events[1].ends_with("\tuse\tb3b2fd750cde2d8d\tcompute\tready\t-"), "{manifest}");
 }
 
 /// Hand the wave64 mirror program to the CreateComputePipelineState hook, dispatch the
