@@ -636,6 +636,12 @@ impl Drop for BeginSubmit {
 }
 
 impl PendingSubmit {
+    /// `finish_marked` without the mark (`false`: all reservations stay pinned).
+    #[cfg(test)]
+    pub(super) unsafe fn finish(self, queue: *mut c_void) -> bool {
+        self.finish_marked(queue).is_ok()
+    }
+
     /// Associate the captured submit with the queue's existing retirement fence (`Err`: all
     /// reservations stay pinned, execution may have happened but cannot be retired), with the
     /// queue fence/value the submit was marked with (`Ok(None)`: nothing to
@@ -1592,9 +1598,9 @@ mod tests {
         move_list(&mut s, seg, now);
         move_list(&mut s, old_seg, aside);
         move_list(&mut s, elsewhere, other);
-        assert!(!unsafe { s.backings[&now].free() });
+        assert!(!unsafe { backing_free_for_test(&s.backings[&now]) });
         unpin_users_in(&mut s, own);
-        assert!(unsafe { s.backings[&now].free() && s.backings[&aside].free() }, "nothing holds them");
+        assert!(unsafe { backing_free_for_test(&s.backings[&now]) && backing_free_for_test(&s.backings[&aside]) }, "nothing holds them");
         assert!(!s.of_list.contains_key(&seg) && !s.of_list.contains_key(&old_seg));
         assert_eq!(s.of_list.get(&elsewhere), Some(&other), "a list on another allocator keeps its hold");
         assert!(s.backings[&other].users.contains(&elsewhere));

@@ -11850,7 +11850,7 @@ mod tests {
             assert!(v.s.chunk_clean(w + 2 * TILE + 0x40), "what landed is what the GPU has: not sent again");
             // so does a copy back …
             let back: Vec<u8> = (0..256u32).map(|i| i as u8 ^ 0x5A).collect();
-            v.s.copy_back(back.as_ptr() as *mut u8, w + 3 * TILE + 0x200, 0, 256, gen(&v.s, w + 3 * TILE));
+            v.s.copy_back(back.as_ptr() as *mut u8, w + 3 * TILE + 0x200, 0, 256, gen(&v.s, w + 3 * TILE), true);
             assert_eq!(std::slice::from_raw_parts((c + 3 * TILE + 0x200) as *const u8, 256), &back[..]);
             // … but one recorded while the tile showed another part of the CPU view
             let before = gen(&v.s, w + TILE);
@@ -11858,7 +11858,7 @@ mod tests {
             v.s.link_mirror(w + TILE, c + 4 * TILE);
             assert!(v.s.new_mirror(w + TILE, c + 4 * TILE, 0, false));
             let tile = v.cpu_tile(4);
-            v.s.copy_back(back.as_ptr() as *mut u8, w + TILE, 0, 256, before);
+            v.s.copy_back(back.as_ptr() as *mut u8, w + TILE, 0, 256, before, true);
             assert_eq!(v.cpu_tile(4), tile, "a copy back of what the tile showed before is left out");
         }
     }
@@ -12416,7 +12416,7 @@ mod tests {
             assert!(v.gpu_bytes(&buf, 0, TILE) == std::slice::from_raw_parts(r as *const u8, TILE), "the chunk written");
             // a copy back recorded before the move lands at the new place
             let back = [0x5Au8; 256];
-            v.s.copy_back(back.as_ptr() as *mut u8, w + 0x200, 0, 256, gen);
+            v.s.copy_back(back.as_ptr() as *mut u8, w + 0x200, 0, 256, gen, true);
             assert_eq!(std::slice::from_raw_parts((r + 0x200) as *const u8, 256), &back[..]);
 
             // a page never used: not committed at its new place, no video memory for it
@@ -12611,7 +12611,7 @@ mod tests {
             v.submit(&[p]);
             assert_eq!(v.s.mapped[&w].holes, 0);
             let back = vec![0xABu8; 256];
-            v.s.copy_back(back.as_ptr() as *mut u8, w + 3 * PAGE, 0, 256, g0);
+            v.s.copy_back(back.as_ptr() as *mut u8, w + 3 * PAGE, 0, 256, g0, true);
             assert_eq!(*(p as *const u64), 0x600D);
             assert!(std::slice::from_raw_parts((p + 8) as *const u8, 248).iter().all(|&b| b == 0), "the GPU's old bytes do not land in the new memory");
             // the second tile shown over the first CPU tile: an immediate of before lands nowhere …

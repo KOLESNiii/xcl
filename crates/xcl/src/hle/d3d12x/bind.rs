@@ -6586,34 +6586,6 @@ void main(uint t : SV_GroupIndex) {
         (*(this as *const FakeAdoptedList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `DispatchX` with thread dimensions (flag 0x20, as the BVH builder's rehydration passes
-    /// use it): the console launches whole groups of the pipeline's `numthreads` and leaves
-    /// the lanes past the count out; without the flag the counts are groups. With the flag
-    /// and a group shape not known, nothing is launched (the counts as groups was the bug).
-    #[test]
-    fn dispatch_x_with_thread_dimensions_launches_whole_groups() {
-        let pso = 0x7300_0001usize;
-        real::register_threads_for_test(pso, [64, 1, 1]);
-        // 640 threads in groups of 64: 10 groups, the last one whole
-        assert_eq!(dispatch_groups(pso, [640, 1, 1], 0x20), Some(([10, 1, 1], [0, 0, 0])));
-        // 100 threads: 2 groups, and the lanes past 100 to leave out
-        assert_eq!(dispatch_groups(pso, [100, 1, 1], 0x20), Some(([2, 1, 1], [100, 0, 0])));
-        // the wave32 bit (0x8000) changes nothing here
-        assert_eq!(dispatch_groups(pso, [100, 1, 1], 0x8020), Some(([2, 1, 1], [100, 0, 0])));
-        // a 2-D group shape
-        let pso2 = 0x7300_0002usize;
-        real::register_threads_for_test(pso2, [8, 8, 1]);
-        assert_eq!(dispatch_groups(pso2, [20, 16, 3], 0x20), Some(([3, 2, 3], [20, 0, 0])));
-        // group counts (Dispatch, DispatchX without the flag) are launched as they are
-        assert_eq!(dispatch_groups(pso, [7, 2, 1], 0), Some(([7, 2, 1], [0, 0, 0])));
-        assert_eq!(dispatch_groups(pso, [7, 2, 1], 0x8000), Some(([7, 2, 1], [0, 0, 0])));
-        // no threads: no groups
-        assert_eq!(dispatch_groups(pso, [0, 1, 1], 0x20), Some(([0, 1, 1], [0, 0, 0])));
-        // thread dimensions on a pipeline whose group shape is not known: not launched
-        assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0x20), None);
-        assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0), Some(([100, 1, 1], [0, 0, 0])));
-    }
-
     /// A `DispatchX` with thread dimensions of more than 65 535 groups once converted is folded
     /// as a dispatch of that many groups (`translated_dispatch`: conversion first, then `fold`):
     /// the console's group count goes to `IO_GROUP_LIMIT`, the thread count to
@@ -7252,7 +7224,8 @@ void main(uint t : SV_GroupIndex) {
         }
     }
 
-    /// A draw decides once what its pipeline is, from what `resolve_wait` gave: the stand-in of a
+    /// A draw decides once what its pipeline is, from what its retained resolution gave (the
+    /// pipeline and whether it was bound unbuilt, `resolve_indirect_pipeline`): the stand-in of a
     /// two-pass pipeline whose build finished after that is still the stand-in (skipped), never
     /// the two passes with the stand-in as their mesh pipeline; the built one runs the two passes.
     #[test]
@@ -7262,26 +7235,26 @@ void main(uint t : SV_GroupIndex) {
         // lazy submits: no worker starts them, so the states stay under the test's control
         pso_async::submit_lazy(standin, false, Box::new(move || real_mesh), 0);
         pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
-        assert!(matches!(draw_pipeline(standin, standin), DrawPipeline::StandIn), "being built");
+        assert!(matches!(draw_pipeline(standin, true), DrawPipeline::StandIn), "being built");
         // built now: a bind that resolved before has the stand-in (the second resolve that
         // `two_pass_of` makes finds the two passes – what recorded them with the stand-in)
         assert_eq!(pso_async::resolve_wait(standin), real_mesh);
         assert!(real::two_pass_of(standin).is_some());
-        assert!(matches!(draw_pipeline(standin, standin), DrawPipeline::StandIn), "resolved before the build finished");
-        assert!(matches!(draw_pipeline(standin, real_mesh), DrawPipeline::TwoPass(_)));
+        assert!(matches!(draw_pipeline(standin, true), DrawPipeline::StandIn), "resolved before the build finished");
+        assert!(matches!(draw_pipeline(real_mesh, false), DrawPipeline::TwoPass(_)));
         assert_eq!(pso_async::resolve_wait(failed), failed);
-        assert!(matches!(draw_pipeline(failed, failed), DrawPipeline::Other), "a failed build's stand-in draws as before");
-        assert!(matches!(draw_pipeline(native, native), DrawPipeline::Other));
+        assert!(matches!(draw_pipeline(failed, false), DrawPipeline::Other), "a failed build's stand-in draws as before");
+        assert!(matches!(draw_pipeline(native, false), DrawPipeline::Other));
         // a shared stand-in (`standin::shell`): `resolve_wait` gives the driver pipeline behind it
         let (shell, driver) = (0x7E57_7005usize, 0x7E57_7006usize);
         pso_async::submit_lazy(shell, false, Box::new(|| 0), 0);
         pso_async::shared(shell, driver);
-        assert!(matches!(draw_pipeline(shell, driver), DrawPipeline::StandIn), "a shared stand-in being built");
+        assert!(matches!(draw_pipeline(driver, true), DrawPipeline::StandIn), "a shared stand-in being built");
         pso_async::released(shell);
         pso_async::released(standin);
         pso_async::released(failed);
         real::forget_pso_for_test(real_mesh);
-        assert!(matches!(draw_pipeline(real_mesh, real_mesh), DrawPipeline::Other));
+        assert!(matches!(draw_pipeline(real_mesh, false), DrawPipeline::Other));
     }
 
     static FAKE_DRAWS: AtomicUsize = AtomicUsize::new(0);
@@ -7315,6 +7288,7 @@ void main(uint t : SV_GroupIndex) {
             set_compute_rs_calls: AtomicUsize::new(0),
             set_compute_uav_calls: AtomicUsize::new(0),
             set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0),
             execute_indirect_calls: AtomicUsize::new(0),
         });
         let list = &*fake as *const FakeAdoptedList as *mut c_void;

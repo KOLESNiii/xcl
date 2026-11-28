@@ -1771,6 +1771,8 @@ mod tests {
                 heap: ID3D12DescriptorHeap::from_raw((&mut global_heap as *mut Object).cast()),
                 cpu: 0x10_0000, gpu: 0x20_0000, inc: 32, cap: 128, next: 80,
                 free: Vec::new(), leases: PublishLeases::default(),
+                nulls: None,
+                retired: VecDeque::new(),
             });
             HEAPS.lock().unwrap().push(Heap {
                 generation: 70, obj: &mut source_heap as *mut Object as usize, shadow: 0x5000,
@@ -2109,6 +2111,7 @@ mod tests {
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x10_0000, gpu: 0x20_0000, inc: 32, cap: base + 2 * PAGE_SLOTS,
                 next: base, free: Vec::new(), retired: VecDeque::new(), nulls: None,
+                leases: PublishLeases::default(),
             });
         }
         let rel = |p: u64| (p as usize - u.base()) as u32;
@@ -2423,6 +2426,7 @@ mod tests {
                 free: Vec::new(),
                 retired: VecDeque::new(),
                 nulls: Some((null_heap, nulls_at)),
+                leases: PublishLeases::default(),
             });
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev: dev.clone(),
@@ -2433,6 +2437,7 @@ mod tests {
                 next: 1,
                 free: Vec::new(),
                 retired: VecDeque::new(),
+                leases: PublishLeases::default(),
             });
 
             assert!(register(0xD100, PAGE_SLOTS, 0x10_0000, 0, 32, false, true, true));
@@ -2576,6 +2581,7 @@ mod tests {
                 free: Vec::new(),
                 retired: VecDeque::from([RetiredRange { first: base, count: range, marks: Some(Vec::new()) }]),
                 nulls: Some((ID3D12DescriptorHeap::from_raw(&mut null_obj as *mut _ as *mut c_void), 0x90_0000)),
+                leases: PublishLeases::default(),
             });
             GLOBAL_RETIRED.store(true, Release);
             HEAPS.lock().unwrap().push(Heap {
@@ -2589,6 +2595,7 @@ mod tests {
                 pages: vec![UNMAPPED],
                 visible: true,
                 memory: Memory::Uma,
+                generation: NEXT_HEAP_GENERATION.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
             });
         }
 
@@ -2700,6 +2707,7 @@ mod tests {
                 next: 64,
                 free: Vec::new(),
                 leases: PublishLeases::default(), retired: VecDeque::new(),
+                nulls: None,
             });
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev,
@@ -2798,6 +2806,7 @@ mod tests {
                 heap: ID3D12DescriptorHeap::from_raw((&mut global_heap as *mut Object).cast()),
                 cpu: 0x10_0000, gpu: 0x18_0000, inc: 32, cap: 4096, next: 72,
                 free: Vec::new(), leases: PublishLeases::default(), retired: VecDeque::new(),
+                nulls: None,
             });
             HEAPS.lock().unwrap().push(Heap {
                 generation: 77, obj: &mut source_heap as *mut Object as usize, shadow: shadow.as_ptr() as usize,

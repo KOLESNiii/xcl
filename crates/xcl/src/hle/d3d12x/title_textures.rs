@@ -6602,11 +6602,12 @@ pub(super) mod tests {
                 gpu_writers: Vec::new(),
                 cpu_backed: true,
             };
-            {
+            let generation = {
                 let mut t = TEXTURES.lock().unwrap();
                 let (d, _) = t.insert(res_id, entry);
                 adjust_pending(d);
-            }
+                t.by_res[&res_id].generation
+            };
             let due = |whole: bool| Due {
                 res: res.clone(),
                 device: 0,
@@ -6618,6 +6619,7 @@ pub(super) mod tests {
                 again: texture_upload::Change::None,
                 target: false,
                 pages: None,
+                generation,
             };
 
             // The whole upload at frame 0 sets the baseline.
@@ -6713,11 +6715,12 @@ pub(super) mod tests {
                 gpu_writers: Vec::new(),
                 cpu_backed: true,
             };
-            {
+            let generation = {
                 let mut t = TEXTURES.lock().unwrap();
                 let (d, _) = t.insert(res_id, entry);
                 adjust_pending(d);
-            }
+                t.by_res[&res_id].generation
+            };
             let due = |whole: bool| Due {
                 res: res.clone(),
                 device: 0,
@@ -6729,6 +6732,7 @@ pub(super) mod tests {
                 again: texture_upload::Change::None,
                 target: false,
                 pages: None,
+                generation,
             };
             let pending = || TEXTURES.lock().unwrap().by_res.get(&res_id).unwrap().pending;
             let entry = || STREAM_RECHECK.lock().unwrap().get(&res_id).copied();
