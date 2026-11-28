@@ -13331,10 +13331,9 @@ mod tests {
             title.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
 
             // Hold `rb_submit` before spawning `readback_after_execute_with`: the worker must finish
-            // its `STATE` snapshot, release `STATE`, and park on `rb_submit` while the main thread
-            // acquires `STATE` cleanly.
+            // its `STATE` snapshot (which takes the submitting token, `SubmittingGuard`), release
+            // `STATE`, and park on `rb_submit` while the main thread acquires `STATE` cleanly.
             let sub_held = iso.rb_submit.lock().unwrap();
-            let q_key = title.as_raw() as usize;
             let state_c = Arc::clone(&iso.state);
             let q_send = SendQueue(title.clone());
             let base = iso.base;
@@ -13343,8 +13342,11 @@ mod tests {
             });
             let t0 = std::time::Instant::now();
             loop {
-                let recorded_queue = iso.state.lock().unwrap().as_ref().unwrap().queue_fences.contains_key(&q_key);
-                if recorded_queue {
+                // (in the code's order: `STATE`, then the readback queue)
+                let state = iso.state.lock().unwrap();
+                let snapshot_taken = iso.rb.lock().unwrap().submitting > 0;
+                drop(state);
+                if snapshot_taken {
                     break;
                 }
                 assert!(t0.elapsed() < std::time::Duration::from_secs(5), "readback_after_execute_with did not release STATE while rb_submit was held");

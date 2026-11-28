@@ -5198,16 +5198,16 @@ static uint xcl_cap = 1u << 16;
                 // control flow), the same EXEC as before for every other dispatch. A wave-local
                 // remap's hardware groups share their console group (`gid / ratio` on its axis;
                 // `gtid` is already the console thread)
-                let cg = match remap {
+                let (cg, group) = match remap {
                     Some((ratio, dim, _)) => {
                         let d = ["x", "y", "z"][dim];
-                        format!("uint3 xcl_cg = xcl_gid; xcl_cg.{d} /= {ratio}u;")
+                        (format!("\n        uint3 xcl_cg = xcl_gid; xcl_cg.{d} = xcl_gid.{d} / {ratio}u;"), "xcl_cg")
                     }
-                    None => "uint3 xcl_cg = xcl_gid;".to_string(),
+                    None => (String::new(), "xcl_gid"),
                 };
                 let _ = writeln!(
                     h,
-                    "    uint scc = 0u;\n    {{\n        uint3 xcl_tl = io.Load3({}u) - 1u;\n        {cg}\n        uint2 e0 = {}(all(xcl_cg * uint3({x}u, {y}u, {z}u) + gtid <= xcl_tl));\n        exec_lo = e0.x; exec_hi = e0.y;\n    }}",
+                    "    uint scc = 0u;\n    {{\n        uint3 xcl_tl = io.Load3({}u) - 1u;{cg}\n        uint2 e0 = {}(all({group} * uint3({x}u, {y}u, {z}u) + gtid <= xcl_tl));\n        exec_lo = e0.x; exec_hi = e0.y;\n    }}",
                     super::IO_THREAD_LIMIT[0] * 4,
                     self.ballot_fn()
                 );

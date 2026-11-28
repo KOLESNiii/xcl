@@ -6044,6 +6044,7 @@ void main(uint t : SV_GroupIndex) {
         let mut orig_vt = [0usize; 64];
         orig_vt[1] = fake_add_ref as usize;
         orig_vt[2] = fake_release as usize;
+        orig_vt[30] = fake_noop_ptr as usize; // SetGraphicsRootSignature
         orig_vt[59] = fake_execute_indirect as usize;
         let mut ext_vt = vec![0usize; 65];
         ext_vt[0] = orig_vt.as_ptr() as usize;
@@ -6057,6 +6058,8 @@ void main(uint t : SV_GroupIndex) {
         let list = &*fake as *const FakeAdoptedList as *mut c_void;
         let native = 0x7100_48B2usize;
         reset(list, 0, native);
+        // a PC pipeline's indirect draw needs the title's graphics root signature (else skipped)
+        unsafe { set_graphics_root_signature(list, 0x7100_48B4usize as *mut c_void) };
         let build_calls = Arc::new(AtomicUsize::new(0));
         let calls = build_calls.clone();
         pso_async::submit_lazy(native, true, Box::new(move || {

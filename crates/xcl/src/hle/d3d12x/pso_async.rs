@@ -10048,7 +10048,8 @@ mod used_tests {
     }
 
     /// A lazy pipeline of shaders an earlier run used is built without a bind; another one is
-    /// built only at its first use, and that use is kept for the next run.
+    /// not kept as used until its first use (the backlog may build it ahead of that: `send_ahead`),
+    /// and that use is kept for the next run.
     #[test]
     fn a_pipeline_an_earlier_run_used_is_built_ahead_of_its_first_use() {
         let (known, unknown) = (0x7E57_7001usize, 0x7E57_7002usize);
@@ -10062,8 +10063,7 @@ mod used_tests {
         }
         assert!(!is_pending(known), "built by the workers that build ahead, with no bind");
         assert_eq!(resolve(known), 0x4321);
-        assert!(is_pending(unknown), "nobody used it and no earlier run did");
-        assert!(!used::noted(unknown_key));
+        assert!(!used::noted(unknown_key), "nobody used it and no earlier run did");
         assert_eq!(resolve_wait(unknown), 0x4322);
         assert!(used::noted(unknown_key) && used::noted(known_key), "a first use is kept for the next run");
         released(known);

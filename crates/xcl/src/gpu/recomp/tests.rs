@@ -8503,13 +8503,12 @@ fn dispatch_thread_limits_seed_compute_exec_for_native_and_remapped_groups() {
     let load = format!("uint3 xcl_tl = io.Load3({}u) - 1u;", super::IO_THREAD_LIMIT[0] * 4);
     let native = translated([8, 8, 1], false);
     assert!(native.hlsl.contains(&load), "{}", native.hlsl);
-    assert!(native.hlsl.contains("uint3 xcl_cg = xcl_gid;"));
-    assert!(native.hlsl.contains("(all(xcl_cg * uint3(8u, 8u, 1u) + gtid <= xcl_tl))"));
+    assert!(native.hlsl.contains("(all(xcl_gid * uint3(8u, 8u, 1u) + gtid <= xcl_tl))"));
     assert!(!native.hlsl.contains("WaveActiveAllTrue(xcl_dispatch_limited)"));
 
     let remapped = translated([128, 1, 1], true);
     assert_eq!(remapped.dispatch_remap, Some((2, 0)));
-    assert!(remapped.hlsl.contains("uint3 xcl_cg = xcl_gid; xcl_cg.x /= 2u;"), "{}", remapped.hlsl);
+    assert!(remapped.hlsl.contains("uint3 xcl_cg = xcl_gid; xcl_cg.x = xcl_gid.x / 2u;"), "{}", remapped.hlsl);
     assert!(remapped.hlsl.contains("xcl_x_ballot(all(xcl_cg * uint3(128u, 1u, 1u) + gtid <= xcl_tl))"));
 }
 
@@ -8858,9 +8857,11 @@ fn compute_prologues_leave_the_lanes_past_a_thread_limit_out_of_exec() {
         assert!(t.complete(), "{what}: {:?}", t.unsupported_why);
         let [x, y, z] = threads;
         let ballot = if split { "xcl_x_ballot" } else { "ballot" };
+        // (a wave-local remap's hardware groups share their console group: `xcl_cg`)
+        let group = if t.dispatch_remap.is_some() { "xcl_cg" } else { "xcl_gid" };
         for want in [
             format!("uint3 xcl_tl = io.Load3({}u) - 1u;", super::IO_THREAD_LIMIT[0] * 4),
-            format!("uint2 e0 = {ballot}(all(xcl_gid * uint3({x}u, {y}u, {z}u) + gtid <= xcl_tl));"),
+            format!("uint2 e0 = {ballot}(all({group} * uint3({x}u, {y}u, {z}u) + gtid <= xcl_tl));"),
         ] {
             assert!(t.hlsl.contains(&want), "{what}: no {want}\n{}", t.hlsl);
         }

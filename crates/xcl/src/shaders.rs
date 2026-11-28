@@ -2794,62 +2794,6 @@ fn progress_count(line: &str) -> Option<usize> {
     d.parse().ok()
 }
 
-/// A pipeline one process builds: a file beside the driver blob it will write (`<blob>.claim`),
-/// made when the build starts and gone when it ends. A second process that finds it leaves the
-/// pipeline to the first. One left behind by a process that died is taken over after `STALE`.
-struct WorkerClaim(PathBuf);
-
-impl WorkerClaim {
-    const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-    /// None: another process has it.
-    fn take(blob: &std::path::Path) -> Option<WorkerClaim> {
-        let mut name = blob.as_os_str().to_owned();
-        name.push(".claim");
-        let path = PathBuf::from(name);
-        let make = || std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
-        match make() {
-            Ok(_) => Some(WorkerClaim(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let old = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Self::STALE);
-                (old && std::fs::remove_file(&path).is_ok() && make().is_ok()).then(|| WorkerClaim(path))
-            }
-            // (the folder cannot be written: nothing is shared through it either)
-            Err(_) => Some(WorkerClaim(PathBuf::new())),
-        }
-    }
-}
-
-impl Drop for WorkerClaim {
-    fn drop(&mut self) {
-        if !self.0.as_os_str().is_empty() {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-}
-
-#[cfg(test)]
-mod claim_tests {
-    use super::WorkerClaim;
-
-    /// The first process to ask builds a pipeline, a second one leaves it, and it is free again
-    /// when the first is done.
-    #[test]
-    fn a_pipeline_is_claimed_by_one_builder_at_a_time() {
-        let dir = std::env::temp_dir().join(format!("xcl-claim-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let blob = dir.join("0123.pso");
-        let first = WorkerClaim::take(&blob).expect("free");
-        assert!(dir.join("0123.pso.claim").exists());
-        assert!(WorkerClaim::take(&blob).is_none(), "claimed");
-        assert!(WorkerClaim::take(&dir.join("4567.pso")).is_some(), "another pipeline is free");
-        drop(first);
-        assert!(!dir.join("0123.pso.claim").exists());
-        assert!(WorkerClaim::take(&blob).is_some(), "free again");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// The compute pipelines of `pack` built by `workers` processes of this program, each on its own
 /// slice of the records (`XCL_PRECOMPILE_SLICE`). A failed worker prevents guest entry.
 fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation,

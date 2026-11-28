@@ -75,8 +75,10 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
         assert!(zeroed(&pre, def(&pre, |l| l.contains("addrspace(3)* @xcl_xc, i32 0, i32 %"))), "mesh, {threads} threads: the counters zeroed before the start's barrier:
 {d}");
     }
-    // with the program's LDS the counters live in its top words
+    // with the program's LDS the counters live in its top words (the address a thread's own,
+    // v0 << 10: a constant one's clamp folds away, `module::opt`)
     let with_lds = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 138), ("VSRC1", 0)], None),
         ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
         ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 256), ("SRC1", 160)], None),
     ]);
