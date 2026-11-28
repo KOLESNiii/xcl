@@ -41,7 +41,8 @@ fn compute_prefix(reader: impl BufRead, cutoff: u64) -> Result<Vec<u64>, String>
             return Err(invalid());
         }
         match fields[2..] {
-            ["use", key, kind @ ("compute" | "graphics"), "ready" | "cold"] => {
+            ["use", key, kind @ ("compute" | "graphics"), "ready" | "cold"] |
+            ["use", key, kind @ ("compute" | "graphics"), "ready" | "cold", _] => {
                 if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(invalid());
                 }
@@ -179,6 +180,8 @@ mod tests {
     fn selects_compute_first_uses_in_order_through_exact_present() {
         assert_eq!(compute_prefix(EVENTS.as_bytes(), 1).unwrap(), [9, 1]);
         assert_eq!(compute_prefix(EVENTS.as_bytes(), 2).unwrap(), [9, 1, 3]);
+        let exact = format!("{HEADER}seq\n0\t0\tuse\t0000000000000009\tcompute\tcold\t0000000000000042\n1\t0\tpresent\t1\n");
+        assert_eq!(compute_prefix(exact.as_bytes(), 1).unwrap(), [9]);
         assert!(compute_prefix(EVENTS.as_bytes(), 4).unwrap_err().contains("no recorded present 4"));
     }
 
