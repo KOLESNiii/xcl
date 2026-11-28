@@ -2636,8 +2636,10 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
         progress.total.store(selected.compute.len() + selected.graphics.len(), Ordering::Relaxed);
         progress.workers.store(1, Ordering::Relaxed);
         let began = std::time::Instant::now();
-        milestone::prepare_launch(&inputs, selected.compute, &options, windows, &progress.adapter, progress, began)?;
-        prepare_history_graphics(&inputs, selected.graphics, windows, &progress.adapter, progress, began, options.budget)?;
+        let mut timing = milestone::HistoryTiming::new(began, options.budget);
+        milestone::prepare_launch(&inputs, selected.compute, &options, windows, &progress.adapter, progress, began, &mut timing)?;
+        prepare_history_graphics(&inputs, selected.graphics, windows, &progress.adapter, progress, began, options.budget, &mut timing)?;
+        timing.finish();
         return Ok(());
     }
     prepare_title_inputs(root, progress, corpus.as_ref())?;
@@ -2984,6 +2986,7 @@ fn exact_graphics_records(
 fn prepare_history_graphics(
     inputs: &[Input], recipe_ids: Vec<u64>, windows: u32, adapter: &str,
     progress: &LaunchPreparation, began: std::time::Instant, budget: std::time::Duration,
+    timing: &mut milestone::HistoryTiming,
 ) -> Result<(), String> {
     if recipe_ids.is_empty() || began.elapsed() >= budget { return Ok(()) }
     let mut payloads = Vec::new();
@@ -3001,13 +3004,16 @@ fn prepare_history_graphics(
     }
     recomp::pso::set_title_windows(windows);
     recomp::dxc::set_memory_reserve(2);
+    let cache_before = crate::hle::d3d12x::real::driver_cache_stats();
     let pipelines = Pipelines::for_adapter(adapter)?;
     let device = crate::hle::d3d12x::real::prepare_device(pipelines.dev.clone());
     let mut confirmed = 0usize;
-    for record in &records {
+    for (recipe_id, record) in recipe_ids.iter().copied().zip(&records) {
         if progress.cancel.load(Ordering::Relaxed) { return Err("Pipeline preparation cancelled".into()) }
         if began.elapsed() >= budget { break }
         let code = |key| shaders.get(&key).map(Vec::as_slice);
+        let kind = if matches!(record, GraphicsHistoryRecord::Mesh(_)) { "mesh" } else { "graphics" };
+        let started = std::time::Instant::now();
         let ok = unsafe { match record {
             GraphicsHistoryRecord::Legacy(record) => {
                 let desc = record.desc(record.shaders.map(code));
@@ -3016,6 +3022,7 @@ fn prepare_history_graphics(
             GraphicsHistoryRecord::Mesh(record) =>
                 crate::hle::d3d12x::real::replay_mesh_record(device, record, record.shaders.map(code)).is_ok(),
         }};
+        timing.record(kind, recipe_id, started.elapsed());
         if !ok { return Err(format!("Graphics history recipe {:016x} failed", record.identity().0)) }
         confirmed += 1;
         progress.done.fetch_add(1, Ordering::Relaxed);
@@ -3023,6 +3030,12 @@ fn prepare_history_graphics(
     crate::xlog_info!(
         "History preparation: {confirmed} of {} exact graphics pipelines confirmed through the launch milestone in {:.1} s",
         records.len(), began.elapsed().as_secs_f64()
+    );
+    let cache_after = crate::hle::d3d12x::real::driver_cache_stats();
+    crate::xlog_info!(
+        "History preparation graphics cache outcomes: {} driver-blob hits, {} rejected blobs, {} new blobs",
+        cache_after.0.saturating_sub(cache_before.0), cache_after.1.saturating_sub(cache_before.1),
+        cache_after.2.saturating_sub(cache_before.2)
     );
     Ok(())
 }

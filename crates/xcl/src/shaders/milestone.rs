@@ -21,6 +21,42 @@ pub(super) struct HistorySelection {
     pub graphics: Vec<u64>,
 }
 
+pub(super) struct HistoryTiming {
+    began: Instant,
+    budget: Duration,
+    count: usize,
+    slow: usize,
+    total: Duration,
+    max: Duration,
+}
+
+impl HistoryTiming {
+    pub fn new(began: Instant, budget: Duration) -> Self {
+        Self { began, budget, count: 0, slow: 0, total: Duration::ZERO, max: Duration::ZERO }
+    }
+
+    pub fn record(&mut self, kind: &str, key: u64, took: Duration) {
+        self.count += 1;
+        self.total += took;
+        self.max = self.max.max(took);
+        if took >= Duration::from_secs(1) {
+            self.slow += 1;
+            crate::xlog_info!(
+                "History preparation: {kind} {key:016x} took {:.1} s; {:.1} s elapsed, {:.1} s budget remaining",
+                took.as_secs_f64(), self.began.elapsed().as_secs_f64(), self.budget.saturating_sub(self.began.elapsed()).as_secs_f64()
+            );
+        }
+    }
+
+    pub fn finish(&self) {
+        crate::xlog_info!(
+            "History preparation timing: {} pipelines, {:.1} s in calls, {:.1} s slowest, {} at least 1 s, {:.1} s wall time, {:.1} s over budget",
+            self.count, self.total.as_secs_f64(), self.max.as_secs_f64(), self.slow,
+            self.began.elapsed().as_secs_f64(), self.began.elapsed().saturating_sub(self.budget).as_secs_f64()
+        );
+    }
+}
+
 pub(super) fn launch_options(cutoff: Option<&str>, seconds: Option<&str>) -> Result<Option<LaunchOptions>, String> {
     let Some(cutoff) = cutoff else { return Ok(None) };
     let cutoff = cutoff.trim().parse::<u64>().ok().filter(|&n| n != 0)
@@ -142,7 +178,7 @@ fn selected_records(inputs: &[Input], keys: Vec<u64>) -> Result<Vec<(u64, usize,
 
 pub(super) fn prepare_launch(
     inputs: &[Input], keys: Vec<u64>, options: &LaunchOptions, windows: u32,
-    adapter: &str, progress: &super::LaunchPreparation, began: Instant,
+    adapter: &str, progress: &super::LaunchPreparation, began: Instant, timing: &mut HistoryTiming,
 ) -> Result<(), String> {
     let selected = selected_records(inputs, keys)?;
     if selected.is_empty() { return Ok(()) }
@@ -162,10 +198,17 @@ pub(super) fn prepare_launch(
         if shaders_key(std::slice::from_ref(&blob)) != key {
             return Err(format!("record for {key:016x} changed during preparation"));
         }
+        let started = Instant::now();
         pipelines.prepare_compute(&blob, windows).map_err(|e| format!("compute {key:016x}: {e}"))?;
+        timing.record("compute", key, started.elapsed());
         progress.done.fetch_add(1, Ordering::Relaxed);
     }
     if let Some(book) = &pipelines.warm_blobs { book.save(); }
+    crate::xlog_info!(
+        "History preparation compute outcomes: {} previously verified, {} pipeline-library/driver-blob reuses, {} uncached native creations",
+        pipelines.verified.load(Ordering::Relaxed), pipelines.reused.load(Ordering::Relaxed),
+        pipelines.created.load(Ordering::Relaxed)
+    );
     crate::xlog_info!(
         "History preparation: {} of {} compute pipelines confirmed through present {} in {:.1} s",
         progress.done.load(Ordering::Relaxed), selected.len(), options.cutoff, began.elapsed().as_secs_f64()
@@ -303,5 +346,16 @@ mod tests {
         for (present, seconds) in [(Some("0"), None), (Some("bad"), None), (Some("1"), Some("0")), (Some("1"), Some("bad"))] {
             assert!(launch_options(present, seconds).is_err());
         }
+    }
+
+    #[test]
+    fn history_timing_tracks_slow_and_total_driver_calls() {
+        let mut timing = HistoryTiming::new(Instant::now(), Duration::from_secs(5));
+        timing.record("compute", 1, Duration::from_millis(900));
+        timing.record("mesh", 2, Duration::from_millis(1200));
+        assert_eq!(timing.count, 2);
+        assert_eq!(timing.slow, 1);
+        assert_eq!(timing.total, Duration::from_millis(2100));
+        assert_eq!(timing.max, Duration::from_millis(1200));
     }
 }
