@@ -46,6 +46,11 @@ const MESH_PIPELINE: u8 = 3;
 const DEPTH_BOUNDS_PIPELINE: u8 = 4;
 const MAX_MESH_LAYOUT: usize = 19; // includes four inactive shader slots and an empty input layout
 
+/// Stable identity of one exact serialized graphics or mesh recipe.
+pub(crate) fn payload_key(payload: &[u8]) -> u64 {
+    crate::gpu::shader::fnv64(payload)
+}
+
 /// New records belong to the active title. A shared translation cache can serve unrelated titles.
 pub(crate) fn path() -> PathBuf {
     if let Some(boot) = crate::state::boot() { return boot.cache_dir().join("used-graphics-pipelines.bin"); }
@@ -603,7 +608,7 @@ impl Writer {
     }
 
     pub(crate) fn add(&mut self, payload: &[u8]) -> std::io::Result<Added> {
-        let id = crate::gpu::shader::fnv64(payload);
+        let id = payload_key(payload);
         if self.seen.contains(&id) {
             return Ok(Added::Known);
         }
