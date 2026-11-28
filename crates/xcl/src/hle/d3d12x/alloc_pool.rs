@@ -150,11 +150,11 @@ impl BackingProbe {
     }
 
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.submit_pins == 0 && self.marks.iter().all(|(_, fence, value)| fence.GetCompletedValue() >= *value)
+        self.users.is_empty() && self.submit_pins == 0 && self.marks.iter().all(|(_, fence, value)| super::real::fence_completed(fence) >= *value)
     }
 
     unsafe fn in_flight(&self) -> bool {
-        self.submit_pins != 0 || self.marks.iter().any(|(_, fence, value)| fence.GetCompletedValue() < *value)
+        self.submit_pins != 0 || self.marks.iter().any(|(_, fence, value)| super::real::fence_completed(fence) < *value)
     }
 
     fn matches(&self, backing: &Backing) -> bool {
@@ -459,7 +459,7 @@ impl SubmissionReceipt {
     }
 
     pub(super) fn completed_value(&self) -> u64 {
-        unsafe { self.marker.fence.GetCompletedValue() }
+        unsafe { super::real::fence_completed(&self.marker.fence) }
     }
 
     pub(super) fn target_value(&self) -> u64 {
@@ -636,15 +636,17 @@ impl Drop for BeginSubmit {
 }
 
 impl PendingSubmit {
-    /// Associate the captured submit with the queue's existing retirement fence. `false` leaves
-    /// all reservations permanently pinned: execution may have happened but cannot be retired.
-    pub(super) unsafe fn finish(self, queue: *mut c_void) -> bool {
+    /// Associate the captured submit with the queue's existing retirement fence (`Err`: all
+    /// reservations stay pinned, execution may have happened but cannot be retired), with the
+    /// queue fence/value the submit was marked with (`Ok(None)`: nothing to
+    /// mark, allocator swapping is off) for the two-pass buffers of the lists (`bind`).
+    unsafe fn finish_marked(self, queue: *mut c_void) -> Result<Option<SubmissionReceipt>, ()> {
         if self.entries.is_empty() {
-            return true;
+            return Ok(None);
         }
-        let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return false };
+        let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return Err(()) };
         let key = queue as usize;
-        super::queue_submit::with(key, || self.finish_with_queue_ops(
+        super::queue_submit::with(key, || self.finish_with_queue_ops_marked(
             key,
             || {
                 let mut dev: Option<ID3D12Device> = None;
@@ -675,16 +677,26 @@ impl PendingSubmit {
     /// The queue turn excludes another thread while the state lock is released around driver
     /// calls. An `Arc` keeps the exact marker alive; replacement means the queue generation was
     /// invalidated, so the submitted work deliberately remains pinned.
+    #[cfg(test)]
     fn finish_with_queue_ops(
         self,
         key: usize,
         create: impl FnOnce() -> Option<ID3D12Fence>,
         signal: impl FnOnce(&ID3D12Fence, u64) -> bool,
     ) -> bool {
+        self.finish_with_queue_ops_marked(key, create, signal).is_ok()
+    }
+
+    fn finish_with_queue_ops_marked(
+        self,
+        key: usize,
+        create: impl FnOnce() -> Option<ID3D12Fence>,
+        signal: impl FnOnce(&ID3D12Fence, u64) -> bool,
+    ) -> Result<Option<SubmissionReceipt>, ()> {
         if self.entries.is_empty() {
-            return true;
+            return Ok(None);
         }
-        self.finish_with_queue_ops_inner(key, create, signal).is_some()
+        self.finish_with_queue_ops_inner(key, create, signal).map(Some).ok_or(())
     }
 
     #[allow(dead_code)] // production consumer lands with the generation-pin stage
@@ -793,6 +805,19 @@ fn reserve_and_execute_with<B, P>(
     true
 }
 
+/// `lists` were just submitted to `queue` (outside `STATE`): the two-pass buffers their recordings
+/// hold go with the queue mark (`None`: unmarked – they fall back to allocator/age holding), and
+/// the queue's finished indirect feedback is read (#2815, #2816).
+unsafe fn two_pass_after_submit(queue: *mut c_void, lists: &[*mut c_void], mark: Option<&SubmissionReceipt>) {
+    if queue.is_null() {
+        return;
+    }
+    if !lists.is_empty() {
+        super::bind::two_pass_submitted(queue, mark.map(|r| &r.marker.fence), mark.map_or(0, |r| r.value), lists);
+    }
+    super::bind::poll_two_pass_feedback(queue);
+}
+
 #[derive(Default)]
 pub(super) struct SubmissionGate {
     failed: bool,
@@ -807,14 +832,25 @@ impl SubmissionGate {
         prepare: impl FnOnce(),
         execute: impl FnOnce(),
     ) -> bool {
-        reserve_and_execute_with(
+        let mut mark = None;
+        let ran = reserve_and_execute_with(
             &mut self.failed,
             || begin_submit(lists),
             prepare,
             BeginSubmit::execution_possible,
             execute,
-            |pending| pending.finish(queue),
-        )
+            |pending| match pending.finish_marked(queue) {
+                Ok(m) => {
+                    mark = m;
+                    true
+                }
+                Err(()) => false,
+            },
+        );
+        if ran {
+            two_pass_after_submit(queue, lists, mark.as_ref());
+        }
+        ran
     }
 
     /// Submit and request an exact retirement receipt. The existing `submit` path remains the
@@ -838,9 +874,13 @@ impl SubmissionGate {
         let pending = begin.execution_possible();
         execute();
         match pending.finish_receipted(queue) {
-            Some(receipt) => ReceiptedSubmission::Executed(receipt),
+            Some(receipt) => {
+                two_pass_after_submit(queue, lists, Some(&receipt));
+                ReceiptedSubmission::Executed(receipt)
+            }
             None => {
                 self.failed = true;
+                two_pass_after_submit(queue, lists, None);
                 ReceiptedSubmission::ExecutedUntracked
             }
         }
@@ -933,6 +973,13 @@ pub(super) fn recording_backing(list: usize) -> Option<usize> {
     STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
 }
 
+/// The title's allocator `alloc` stands for the PC allocator `pc` (as after a Reset put its own
+/// aside); `pc == alloc` ends that.
+#[cfg(test)]
+pub(super) fn stand_in_for_test(alloc: usize, pc: usize) {
+    STATE.lock().unwrap().get_or_insert_with(State::default).cur.insert(alloc, pc);
+}
+
 /// The PC allocator the title's allocator `alloc` stands for now.
 pub fn current(alloc: usize) -> usize {
     if !enabled() {
@@ -978,7 +1025,7 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     }
     let incomplete: Vec<_> = probes
         .into_iter()
-        .filter(|(_, _, last)| last.fence.GetCompletedValue() < last.value)
+        .filter(|(_, _, last)| super::real::fence_completed(&last.fence) < last.value)
         .collect();
     if incomplete.is_empty() {
         return 0;
@@ -1015,8 +1062,81 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     found
 }
 
+/// How long a submit waits for the previous submits of its lists (`XCL_RESUBMIT_WAIT_MS`, 2 000;
+/// 0: not at all, as before).
+fn resubmit_wait() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("XCL_RESUBMIT_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)))
+}
+
+/// `lists` are about to be submitted: the ones whose previous submit the GPU has not finished
+/// (`note_resubmits`) wait for it first, `limit` at most for all of them; then they go as they
+/// are. On the PC a list must not be executed again before its previous execution is done (debug
+/// layer id 553); a console lets a title do it, and a retail title did it about once a second in
+/// its world – 128 times before its device was removed with shader memory faults, and not once in
+/// a run that ended well. Returns (lists waited for, of them not done in time).
+pub unsafe fn wait_for_previous_submits(lists: &[*mut c_void]) -> (usize, usize) {
+    wait_for_previous_submits_within(lists, resubmit_wait())
+}
+
+unsafe fn wait_for_previous_submits_within(lists: &[*mut c_void], limit: std::time::Duration) -> (usize, usize) {
+    if !enabled() || limit.is_zero() {
+        return (0, 0);
+    }
+    // (the fences are taken out: nothing is waited for with STATE held)
+    let pending: Vec<(ID3D12Fence, u64)> = {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return (0, 0) };
+        lists
+            .iter()
+            .filter_map(|&l| s.last_submit.get(&(l as usize)))
+            .filter(|l| super::real::fence_completed(&l.fence) < l.value)
+            .map(|l| (l.fence.clone(), l.value))
+            .collect()
+    };
+    if pending.is_empty() {
+        return (0, 0);
+    }
+    let start = std::time::Instant::now();
+    let mut late = 0;
+    for (fence, value) in &pending {
+        // (XCL's own fence, read without the title's hook; a removed device reads as the largest
+        // value: no wait then. Such a submit is milliseconds from done: a short poll)
+        let mut polls = 0u32;
+        while super::real::fence_completed(fence) < *value {
+            if start.elapsed() >= limit {
+                late += 1;
+                break;
+            }
+            if polls < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            polls += 1;
+        }
+    }
+    static WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if late > 0 {
+        crate::xlog_warn!(
+            "D3D12.X: {late} of {} previous submits of lists submitted again were not done after {} ms – they go as they are (#{n} such submits)",
+            pending.len(),
+            limit.as_millis()
+        );
+    } else if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: a submit waited {:.1} ms for the previous submits of {} of its lists (#{n} such submits)",
+            start.elapsed().as_secs_f64() * 1e3,
+            pending.len()
+        );
+    }
+    (pending.len(), late)
+}
+
 /// Whether the GPU has not finished the last submit of the PC list `list` (#1452: it must not be
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
+/// (`fence_completed`: XCL's own fence, without the title's hook, STATE held)
 pub fn in_flight(list: usize) -> bool {
     let (lifetime, last) = {
         let g = STATE.lock().unwrap();
@@ -1028,7 +1148,7 @@ pub fn in_flight(list: usize) -> bool {
         let Some(last) = s.last_submit.get(&list).cloned() else { return false };
         (lifetime, last)
     };
-    if unsafe { last.fence.GetCompletedValue() } < last.value {
+    if unsafe { super::real::fence_completed(&last.fence) } < last.value {
         return true;
     }
     // If the address changed generation, or another submit was reserved/published while the
@@ -1046,6 +1166,28 @@ pub fn in_flight(list: usize) -> bool {
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     let Some(begin) = begin_submit(lists) else { return };
     let _ = begin.execution_possible().finish(queue);
+}
+
+/// The lists recording on the PC allocators of `alloc` hold them no more: the allocator a title
+/// list keeps for its put-off dispatches goes with the list, before the list's segments that
+/// recorded on it are released (`list_x::on_release`), and `forget` gives back only what nothing
+/// holds.
+pub(super) fn unpin_users(alloc: usize) {
+    let mut g = STATE.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        unpin_users_in(s, alloc);
+    }
+}
+
+fn unpin_users_in(s: &mut State, alloc: usize) {
+    let mine: Vec<usize> = s.cur.get(&alloc).copied().into_iter().chain(s.aside.get(&alloc).into_iter().flatten().copied()).chain([alloc]).collect();
+    for b in mine {
+        if let Some(b) = s.backings.get_mut(&b) {
+            for l in std::mem::take(&mut b.users) {
+                s.of_list.remove(&l);
+            }
+        }
+    }
 }
 
 /// Whether the GPU may still run a recording made on the title's allocator `alloc`.
@@ -1255,6 +1397,11 @@ fn take_shared_aside(
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
+///
+/// What ended recordings left in unified memory is held per PC allocator
+/// (`console_list::hold_until_reset`). It goes back here for the PC allocators of `alloc` whose
+/// submits the GPU has passed – not for one put aside because the GPU still runs what was
+/// recorded on it (#1358).
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     if !enabled() {
         return None;
@@ -1431,6 +1578,27 @@ fn commit_reset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When a title list goes, the segments that recorded its put-off dispatches on its own
+    /// allocator hold neither the PC allocator it stands for now nor the ones put aside: `forget`
+    /// then releases those the GPU is done with (they were left behind, with what was held on them).
+    #[test]
+    fn the_own_allocator_of_a_list_that_goes_is_held_by_none_of_its_segments() {
+        let (own, now, aside, other) = (0x1000usize, 0x2000usize, 0x3000usize, 0x4000usize);
+        let (seg, old_seg, elsewhere) = (0x5000usize, 0x6000usize, 0x7000usize);
+        let mut s = State::default();
+        s.cur.insert(own, now);
+        s.aside.insert(own, vec![aside]);
+        move_list(&mut s, seg, now);
+        move_list(&mut s, old_seg, aside);
+        move_list(&mut s, elsewhere, other);
+        assert!(!unsafe { s.backings[&now].free() });
+        unpin_users_in(&mut s, own);
+        assert!(unsafe { s.backings[&now].free() && s.backings[&aside].free() }, "nothing holds them");
+        assert!(!s.of_list.contains_key(&seg) && !s.of_list.contains_key(&old_seg));
+        assert_eq!(s.of_list.get(&elsewhere), Some(&other), "a list on another allocator keeps its hold");
+        assert!(s.backings[&other].users.contains(&elsewhere));
+    }
 
     #[test]
     fn release_probe_transfers_only_the_logical_final_reference() {
@@ -2476,6 +2644,60 @@ mod tests {
         );
     }
 
+    /// The title's Reset (through `real::alloc_reset`) while the GPU has not run a submit of a
+    /// recording on its allocator: the allocator is put aside, and what the recording left in
+    /// unified memory stays until the GPU has passed it (#1358).
+    #[test]
+    fn a_reset_that_puts_the_allocator_aside_keeps_what_the_gpu_still_reads() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a = alloc.as_raw();
+            if !super::super::real::is_adopted(a) {
+                super::super::real::adopt(a, super::super::real::Kind::CommandAllocator);
+            }
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let l = list.as_raw() as usize;
+            created_on(l, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            list.Close().unwrap();
+            // the queue runs the list only once `gate` is signalled
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            executed(queue.as_raw(), &[l as *mut c_void]);
+            // the list's recording ends; what it put in unified memory is held for the allocator
+            forget_list(l);
+            let block = l + 1;
+            super::super::console_list::hold_until_reset(a as usize, vec![block]);
+
+            alloc.Reset().unwrap();
+            let stand_in = current(a as usize);
+            let held = super::super::console_list::take_pending_for_test(a as usize);
+            super::super::console_list::hold_until_reset(a as usize, held.clone());
+
+            gate.Signal(1).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&done, 1).unwrap();
+            let start = std::time::Instant::now();
+            while done.GetCompletedValue() < 1 && start.elapsed().as_secs() < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let ran = done.GetCompletedValue() >= 1;
+            alloc.Reset().unwrap();
+            let after = super::super::console_list::take_pending_for_test(a as usize);
+            drop(list);
+            drop(alloc);
+
+            assert_ne!(stand_in, a as usize, "the GPU had not run the submit: another PC allocator took the place");
+            assert_eq!(held, vec![block], "the memory of a recording the GPU had not run is held over the Reset");
+            assert!(ran, "the queue finishes");
+            assert!(after.is_empty(), "the GPU passed the submit: the next Reset gives the memory back");
+        }
+    }
+
     /// A list recorded once and submitted again after the title reset its allocator: the
     /// recording is still there (the device is not removed), the title's allocator goes on with
     /// another PC allocator, and the first one is used again once the list has moved on.
@@ -2590,6 +2812,49 @@ mod tests {
             assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    /// A list whose previous submit still runs is waited for before it is submitted again: until
+    /// that submit is done, or the limit; a list with nothing running is not waited for.
+    #[test]
+    fn a_resubmit_waits_for_the_previous_submit() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a fence the GPU has not reached stands for a submit still running
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut ids = Box::new([0u8; 2]);
+            let (alloc, list) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1);
+            created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                let recording = s.recordings[&list];
+                s.last_submit.insert(list, LastSubmit { queue: 0x10, fence: fence.clone(), value: 1, recording });
+            }
+            let lists = [list as *mut c_void];
+            // it never finishes: the limit ends the wait, and says so
+            let t = std::time::Instant::now();
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_millis(30)), (1, 1));
+            assert!(t.elapsed() >= std::time::Duration::from_millis(30));
+            // no limit: no wait
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::ZERO), (0, 0));
+            // it finishes meanwhile: the wait ends then, far before the limit
+            let signal = fence.clone();
+            let done = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                signal.Signal(1).unwrap();
+            });
+            let t = std::time::Instant::now();
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_secs(20)), (1, 0));
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the wait ends when the submit is done");
+            done.join().unwrap();
+            // nothing runs now: nothing to wait for
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_secs(20)), (0, 0));
+            forget_list(list);
+            forget(alloc);
         }
     }
 }

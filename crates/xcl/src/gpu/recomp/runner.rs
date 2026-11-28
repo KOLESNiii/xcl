@@ -158,7 +158,23 @@ impl TexDim {
     }
 }
 
-/// A texture for kernel tests: SRV at heap index 2·i, UAV (if `uav`) at 2·i + 1.
+/// The typeless depth-stencil format of a stencil view format (None: not a stencil view).
+fn stencil_resource(view: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    match view {
+        DXGI_FORMAT_X24_TYPELESS_G8_UINT => Some(DXGI_FORMAT_R24G8_TYPELESS),
+        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => Some(DXGI_FORMAT_R32G8X24_TYPELESS),
+        _ => None,
+    }
+}
+
+/// The plane a test texture's data and SRV are in: 1 for a stencil view.
+fn first_plane(t: &TestTexture) -> u32 {
+    u32::from(stencil_resource(t.format).is_some())
+}
+
+/// A texture for kernel tests: SRV at heap index 2·i, UAV (if `uav`) at 2·i + 1. A D2 texture in
+/// a stencil view format (X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT) is a depth-stencil
+/// buffer whose stencil plane holds `data` (one byte a texel); its SRV is that view of plane 1.
 pub struct TestTexture {
     pub dim: TexDim,
     pub format: DXGI_FORMAT,
@@ -274,15 +290,21 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             Height: t.height,
             DepthOrArraySize: depth_or_array as u16,
             MipLevels: 1,
-            Format: t.format,
+            Format: stencil_resource(t.format).unwrap_or(t.format),
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Flags: if t.uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+            Flags: if t.uav {
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            } else if stencil_resource(t.format).is_some() {
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+            } else {
+                D3D12_RESOURCE_FLAG_NONE
+            },
             ..Default::default()
         } };
         let subs = if t.dim == TexDim::D3 { 1 } else { t.depth };
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
         let mut size = 0u64;
-        dev.GetCopyableFootprints(&rd, 0, subs, total, Some(fps.as_mut_ptr()), None, None, Some(&mut size));
+        dev.GetCopyableFootprints(&rd, first_plane(t), subs, total, Some(fps.as_mut_ptr()), None, None, Some(&mut size));
         total = (total + size + 511) & !511;
         plans.push(fps);
         descs.push(rd);
@@ -340,7 +362,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             list.CopyBufferRegion(&r, 0, upload.as_ref().unwrap(), fps[0].Offset, rd.Width);
         }
         for (k, fp) in fps.iter().enumerate().filter(|_| t.dim != TexDim::Buffer) {
-            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: first_plane(t) + k as u32 } };
             let src = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: transmute_copy(upload.as_ref().unwrap()),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -361,7 +383,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             }
             TexDim::D2 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, PlaneSlice: first_plane(t), ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             }
             TexDim::D2Array => {
@@ -533,6 +555,14 @@ fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RE
 }
 
 /// Name of the GPU the kernels run on (None: no usable GPU).
+/// The tests' device (with the Agility SDK when there is one): a test that makes its own device
+/// first leaves the SDK unappliable for the process (0x887E0003), and the GPU tests after it skip.
+pub fn device() -> Result<ID3D12Device, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.dev.clone()).map_err(|x| x.clone())
+}
+
 pub fn adapter() -> Result<String, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init);
@@ -1480,22 +1510,39 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let dev = &gpu.dev;
         let dev3: ID3D12Device3 = dev.cast().map_err(e)?;
         let mut bufs: Vec<ID3D12Resource> = Vec::new();
+        // a D3D12 without heaps over process memory (D3DMetal: E_NOTIMPL): each window is a
+        // buffer in video memory, filled from the window before the dispatch and copied back
+        // after it -- (upload, readback) per window
+        let mut copies: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
         for &(base, size) in &arena.windows {
-        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const std::ffi::c_void).map_err(|x| format!("OpenExistingHeapFromAddress: {x}"))?;
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size as u64,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
-            ..Default::default()
-        };
-        let mut mem_buf: Option<ID3D12Resource> = None;
-        dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut mem_buf).map_err(|x| format!("CreatePlacedResource: {x}"))?;
-        bufs.push(mem_buf.ok_or("arena")?);
+            let heap: ID3D12Heap = match dev3.OpenExistingHeapFromAddress(base as *const std::ffi::c_void) {
+                Ok(h) => h,
+                Err(x) if x.code() == windows::Win32::Foundation::E_NOTIMPL => {
+                    let up = buffer(dev, size as u64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+                    let mut p = std::ptr::null_mut();
+                    up.Map(0, None, Some(&mut p)).map_err(e)?;
+                    std::ptr::copy_nonoverlapping(base, p as *mut u8, size);
+                    up.Unmap(0, None);
+                    bufs.push(buffer(dev, size as u64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?);
+                    copies.push((up, buffer(dev, size as u64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?));
+                    continue;
+                }
+                Err(x) => return Err(format!("OpenExistingHeapFromAddress: {x}")),
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+                ..Default::default()
+            };
+            let mut mem_buf: Option<ID3D12Resource> = None;
+            dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut mem_buf).map_err(|x| format!("CreatePlacedResource: {x}"))?;
+            bufs.push(mem_buf.ok_or("arena")?);
         }
         let mem_buf = bufs[0].clone();
         let pso: ID3D12PipelineState = dev
@@ -1518,13 +1565,18 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
+        // (a buffer in COMMON takes the copy as it is)
+        for (b, (up, _)) in bufs.iter().zip(&copies) {
+            list.CopyBufferRegion(b, 0, up, 0, b.GetDesc().Width);
+        }
+        let filled = if copies.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_DEST };
         list.ResourceBarrier(&[
             transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            transition(&mem_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&mem_buf, filled, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         for b in &bufs[1..] {
-            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            list.ResourceBarrier(&[transition(b, filled, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
         }
         // the windows as raw UAVs at MEM_HEAP_BASE.. of a shader-visible heap
         // (`Options::heap_windows`; programs with the root-UAV switch ignore it)
@@ -1557,18 +1609,28 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             list.SetComputeRootUnorderedAccessView(2 + k as u32, bufs.get(k).unwrap_or(&mem_buf).GetGPUVirtualAddress());
         }
         list.Dispatch(1, 1, 1);
+        let after = if copies.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_SOURCE };
         list.ResourceBarrier(&[
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, after),
         ]);
         for b in &bufs[1..] {
-            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
+            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, after)]);
         }
         list.CopyBufferRegion(&readback, 0, &res_buf, 0, res_bytes);
+        for (b, (_, back)) in bufs.iter().zip(&copies) {
+            list.CopyBufferRegion(back, 0, b, 0, b.GetDesc().Width);
+        }
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
         wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "arena dispatch")?;
+        for (&(base, size), (_, back)) in arena.windows.iter().zip(&copies) {
+            let mut q = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut q)).map_err(e)?;
+            std::ptr::copy_nonoverlapping(q as *const u8, base, size);
+            back.Unmap(0, None);
+        }
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
         let raw = std::slice::from_raw_parts(q as *const u32, KERNEL_RES_DWORDS).to_vec();
@@ -1816,8 +1878,9 @@ fn dispatch_with(
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        for k in 0..4 {
-            list.SetComputeRootUnorderedAccessView(2 + k as u32, mem_buf.GetGPUVirtualAddress());
+        // every window (u2..u5) is `mem`, as in the heap above
+        for k in 2..6 {
+            list.SetComputeRootUnorderedAccessView(k, mem_buf.GetGPUVirtualAddress());
         }
         let scratch = chain.map(|(_, words, most)| {
             let first = super::pso::dispatch_slabs(groups, most)[0].1;

@@ -48,12 +48,18 @@ const MAX_MESH_LAYOUT: usize = 19; // includes four inactive shader slots and an
 
 /// New records belong to the active title. A shared translation cache can serve unrelated titles.
 pub(crate) fn path() -> PathBuf {
-    if let Some(boot) = crate::state::boot() { return boot.cache_dir().join("used-graphics-pipelines.bin"); }
+    let name = history_file_name();
+    if let Some(boot) = crate::state::boot() { return boot.cache_dir().join(name); }
     shared_history_path()
 }
 
+/// `used-graphics-pipelines.bin`, or its Series S (`lockhart`) name.
+fn history_file_name() -> String {
+    super::pso_async::used_file_name("used-graphics-pipelines", "bin", super::pso_async::profile_is_series_s())
+}
+
 pub(crate) fn shared_history_path() -> PathBuf {
-    crate::gpu::recomp::dxc::cache_dir().join("used-graphics-pipelines.bin")
+    crate::gpu::recomp::dxc::cache_dir().join(history_file_name())
 }
 
 /// `XCL_GFX_RECORDS_MB`: the most the records may take on disk (64 MB: ~300 000 pipelines).

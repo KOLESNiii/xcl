@@ -55,7 +55,12 @@ impl FenceTable {
         if !*live {
             return;
         }
-        if let Some(v) = unsafe { borrowed(fence, |f| f.GetCompletedValue()) } {
+        if let Some(v) = unsafe { borrowed(fence, |f| super::real::fence_completed(f)) } {
+            // what the lists wrote into the title's memory lands before the value that says they
+            // are done (the title reads a cell and then the memory: the cell is no promise of the
+            // hooked GetCompletedValue, which lands it as well)
+            // (under this cell's lock only: `note_queue_signal` takes the table's)
+            unsafe { super::sparse::settle_readbacks_within(20) };
             if super::title_textures::complete_fence_downloads(fence, v) {
                 mirror.cell.0.store(v, Ordering::Release);
             }
@@ -98,7 +103,7 @@ impl FenceTable {
         };
         let mut parts = Vec::new();
         for (p, signalled, waited, has_cell) in snap {
-            let done = unsafe { borrowed(p, |f| f.GetCompletedValue()) }.unwrap_or(0);
+            let done = unsafe { borrowed(p, |f| super::real::fence_completed(f)) }.unwrap_or(0);
             if done < signalled || done < waited {
                 parts.push(format!("{p:#x}(done={done:#x}/sig={signalled:#x}/wait={waited:#x},cell={has_cell})"));
             }

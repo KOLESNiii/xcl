@@ -113,8 +113,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut last = activity.then(snap);
             let mut last_looks = activity.then(crate::hle::d3d12x::sparse::look_counters);
             let mut pressure_turn = 0u64;
+            let mut cost = crate::hle::api_cost::totals();
+            let mut own_cost = crate::hle::api_cost::submitter_totals();
+            let mut views = crate::hle::d3d12x::view_want::totals();
+            let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
+            let mut last_tick = std::time::Instant::now();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                let window_ms = last_tick.elapsed().as_millis() as u64;
+                last_tick = std::time::Instant::now();
                 let owner = activity.then(crate::hle::d3d12x::memory_report::snapshot);
                 if pressure {
                     pressure_turn = pressure_turn.wrapping_add(1);
@@ -138,25 +145,53 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     crate::hle::d3d12x::sparse::look_delta(looks, last_looks.unwrap()), 2,
                 ));
                 last_looks = Some(looks);
+                // the time the title's threads spent in some of XCL's calls
+                let spent = crate::hle::api_cost::totals();
+                let calls = crate::hle::api_cost::all_threads_summary_parts(&spent, &cost);
+                cost = spent;
+                if !calls.is_empty() {
+                    crate::xlog_info!("calls (2 s, all threads): {}", calls.join(", "));
+                }
+                // `XCL_LOOK_STATS=2`: those of the thread that submits, its submits and presents
+                // with them: the time of its frames, added up
+                let spent = crate::hle::api_cost::submitter_totals();
+                if let Some(summary) = crate::hle::api_cost::submitter_summary_line(&spent, &own_cost, window_ms) {
+                    crate::xlog_info!("calls of the submitting thread (2 s): {summary}");
+                }
+                own_cost = spent;
+                // the addresses in its GPU view the title gave the GPU, by the path they took
+                let asked = crate::hle::d3d12x::view_want::totals();
+                if let Some(line) = crate::hle::d3d12x::view_want::line(&asked, &views) {
+                    crate::xlog_info!("GPU view (2 s): {line}");
+                }
+                views = asked;
+                // the sparse queue's UpdateTileMappings calls and tiles, by kind of window
+                let mappings = crate::hle::d3d12x::sparse::tile_calls();
+                if let Some(line) = crate::hle::d3d12x::sparse::tile_calls_line(&mappings, &tile_calls) {
+                    crate::xlog_info!("tile mappings (2 s): {line}");
+                }
+                tile_calls = mappings;
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let owner = owner.unwrap();
                 let private = owner.commit.unwrap_or(0);
                 let local = owner.local.map_or(0, |s| s.usage);
                 let non_local = owner.non_local.map_or(0, |s| s.usage);
+                let budget = owner.local.map_or(0, |s| s.budget);
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
+                // (at the end: tools read the line's beginning; the guard script reads the budget)
+                let mut budget_text = if budget != 0 { format!("; video memory budget {} MB", mb(budget)) } else { String::new() };
                 // the system's commit: this process's memory counts against it with every other
                 // program's (video memory does not), and where it ends allocations fail
                 let (commit, commit_limit) = system_commit();
-                let mut commit_text = String::new();
                 if commit_limit != 0 {
-                    commit_text = format!("; system commit {} of {} MB", mb(commit), mb(commit_limit));
-                    warn_low_commit(commit, commit_limit, private as u64, local);
+                    budget_text += &format!("; system commit {} of {} MB", mb(commit), mb(commit_limit));
+                    warn_low_commit(commit, commit_limit, private, local);
                 }
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped){commit_text}",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped){budget_text}",
                     mb(private),
                     mb(local),
                     mb(non_local),
@@ -189,6 +224,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         mtex(ts.total_texels),
                         pct
                     );
+                }
+                if pages != 0 {
+                    crate::xlog_info!("{}", crate::hle::d3d12x::vram::page_owners());
+                }
+                // past the budget Windows moves the process's video memory off the card and
+                // every frame pays for bringing it back; a run at the card's limit is also
+                // where the driver gave up (the guard script ends a run that stays there)
+                if let Some(over) = crate::hle::d3d12x::real::over_video_budget(local, budget) {
+                    crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget));
                 }
                 last = Some(now);
             }

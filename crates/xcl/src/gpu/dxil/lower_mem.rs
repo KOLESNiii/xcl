@@ -1185,6 +1185,9 @@ impl Lw {
             let base = self.add(d0, off);
             let base_aligned = self.andc(base, !3);
             let raw = self.mem_ld_chunks(base_aligned, count);
+            // (a V# on the constant data in the code: only with windows, where its high
+            // dword tells it from the title's memory)
+            let raw = if self.windowed() { self.rodata_loads(base_aligned, raw) } else { raw };
             let z = self.c(0);
             (0..count)
                 .map(|i| {
@@ -1211,7 +1214,9 @@ impl Lw {
             let a = self.add(b, k);
             let a = self.add(a, soff);
             let base_aligned = self.andc(a, !3);
-            self.mem_ld_chunks(base_aligned, count)
+            let raw = self.mem_ld_chunks(base_aligned, count);
+            // (constant data in the code)
+            self.rodata_loads(base_aligned, raw)
         };
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
@@ -1546,7 +1551,7 @@ impl Lw {
     // ------------------------------------------------------------ atomics
 
     /// A 32-bit atomic; returns the old value (valid in the guarded block it runs in).
-    fn rmw32(&mut self, d: &Decoded, op: &str, at: At, v: Value, v2: Value) -> LResult<Value> {
+    fn rmw32(&mut self, d: &Decoded, op: &str, at: At, v: Value, second_vgpr: u64) -> LResult<Value> {
         let direct = |lw: &mut Lw, o: AtomicOp, rm: RmwOp, val: Value| -> Value {
             match at {
                 At::Mem(a) => {
@@ -1573,8 +1578,14 @@ impl Lw {
             "umax" | "max_u32" => direct(self, AtomicOp::UMax, RmwOp::UMax, v),
             "smin" | "min_i32" => direct(self, AtomicOp::IMin, RmwOp::Min, v),
             "smax" | "max_i32" => direct(self, AtomicOp::IMax, RmwOp::Max, v),
-            "cmpswap" | "cmpst_b32" => self.cmpxchg(at, v2, v),
-            "fcmpswap" | "cmpst_f32" => self.fcas32(at, v2, v),
+            "cmpswap" | "cmpst_b32" => {
+                let cmp = self.vreg(second_vgpr);
+                self.cmpxchg(at, cmp, v)
+            }
+            "fcmpswap" | "cmpst_f32" => {
+                let cmp = self.vreg(second_vgpr);
+                self.fcas32(at, cmp, v)
+            }
             "fmin" | "fmax" | "min_f32" | "max_f32" => {
                 let min = op == "fmin" || op == "min_f32";
                 match at {
@@ -1611,11 +1622,14 @@ impl Lw {
                 let r = lw.fadd(x, y);
                 lw.bits(r)
             }),
-            "mskor_b32" => self.cas(at, &mut |lw, c| {
-                let n = lw.not(v);
-                let x = lw.and(c, n);
-                lw.or(x, v2)
-            }),
+            "mskor_b32" => {
+                let bits = self.vreg(second_vgpr);
+                self.cas(at, &mut |lw, c| {
+                    let n = lw.not(v);
+                    let x = lw.and(c, n);
+                    lw.or(x, bits)
+                })
+            }
             _ => return err(d, "atomic"),
         })
     }
@@ -1936,7 +1950,7 @@ impl Lw {
         if x2 {
             return self.atomic64(d, op, a, vdata, vdata + 2, f("GLC") == 1, vdata, active);
         }
-        let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
+        let v = self.vreg(vdata);
         let glc = f("GLC") == 1;
         let ops = op.to_string();
         let tmp = self.tmp_var();
@@ -1944,7 +1958,7 @@ impl Lw {
         self.wr(tmp, z);
         let mut e = None;
         self.guarded(active, &mut |lw| {
-            match lw.rmw32(d, &ops, At::Mem(a), v, cmp) {
+            match lw.rmw32(d, &ops, At::Mem(a), v, vdata + 1) {
                 Ok(o) => lw.wr(tmp, o),
                 Err(x) => e = Some(x),
             }
@@ -2043,6 +2057,13 @@ impl Lw {
         } else {
             let vd = Self::fv(d, "VDST");
             let loaded = self.mem_ld_n(Some(act), a, count as u32);
+            // (constant data in the code)
+            let loaded = if self.rodata.is_empty() {
+                loaded
+            } else {
+                let a = self.andc(a, !3);
+                self.rodata_loads(a, loaded)
+            };
             for i in 0..count {
                 self.write32(&Dst::V(vd + i), loaded[i as usize]);
             }
@@ -2062,12 +2083,11 @@ impl Lw {
             return self.atomic64(d, op, a, data, data + 2, glc, Self::fv(d, "VDST"), act);
         }
         let v = self.vreg(data);
-        let cmpv = self.vreg(data + 1);
         let vd = Self::fv(d, "VDST");
         let ops = op.to_string();
         let mut e = None;
         self.guarded(act, &mut |lw| {
-            match lw.rmw32(d, &ops, At::Mem(a), v, cmpv) {
+            match lw.rmw32(d, &ops, At::Mem(a), v, data + 1) {
                 Ok(o) => {
                     if glc {
                         lw.vset(vd, o);
@@ -2144,6 +2164,7 @@ impl Lw {
         if f("GDS") != 0 {
             return err(d, "GDS");
         }
+        self.lds_in_order(name)?;
         let act = self.act();
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
             let m0 = self.sreg(124);
@@ -2289,14 +2310,14 @@ impl Lw {
                 Ok(())
             });
         }
-        let (d0, d1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
-        let (v, v2) = if op.starts_with("cmpst_") { (d1, d0) } else { (d0, d1) };
+        let (d0, d1) = (f("DATA0"), f("DATA1"));
+        let (v, second_vgpr) = if op.starts_with("cmpst_") { (self.vreg(d1), d0) } else { (self.vreg(d0), d1) };
         let at = self.addc(a, off16);
         let vd = f("VDST");
         let mut e = None;
         self.guarded(act, &mut |lw| {
             let i = lw.lds_index(at);
-            match lw.rmw32(d, &op, At::Lds(i), v, v2) {
+            match lw.rmw32(d, &op, At::Lds(i), v, second_vgpr) {
                 Ok(o) => {
                     if rtn {
                         lw.vset(vd, o);
@@ -2534,9 +2555,9 @@ impl Lw {
             }
         };
         let enabled = |c: usize| if compr { en >> (c / 2 * 2) & 3 != 0 } else { en >> c & 1 == 1 };
-        let (vtx, prm) = {
+        let (vtx, prm, vok, pok) = {
             let m = self.mesh.as_ref().expect("mesh");
-            (m.vtx, m.prm)
+            (m.vtx, m.prm, m.vok, m.pok)
         };
         // (dword index in res, value)
         let mut st: Vec<(Value, Value)> = Vec::new();
@@ -2573,6 +2594,8 @@ impl Lw {
         }
         let res = self.res.expect("res");
         let act = self.act();
+        // (only into this thread's own slot of the record: `MeshCtx::vok` / `pok`)
+        let act = self.land(act, if tgt == 20 { pok } else { vok });
         self.guarded(act, &mut |lw| {
             for &(at, v) in &st {
                 let off = lw.shlc(at, 2);

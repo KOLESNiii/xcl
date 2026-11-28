@@ -146,8 +146,15 @@ fn split_wave64_real_lds_is_left_to_the_hlsl_path() {
     let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
 
-    let e = kernel::translate_compute(&write, o(true, true), &cs).err().expect("split LDS translated");
-    assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+    // the direct translator orders split LDS itself (`XCL_X_LDS_ORDER`, on by default); without
+    // that order the program is left to the HLSL path
+    let split = kernel::translate_compute(&write, o(true, true), &cs);
+    if crate::gpu::recomp::emit::lds_order_wanted() {
+        split.expect("split LDS in order");
+    } else {
+        let e = split.err().expect("split LDS translated without its order");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+    }
     kernel::translate_compute(&write, o(true, false), &cs).expect("native wave64 LDS");
     kernel::translate_compute(&write, o(false, false), &cs).expect("native wave32 LDS");
     kernel::translate_compute(&swizzle, o(true, true), &cs).expect("split cross-lane DS");

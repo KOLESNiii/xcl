@@ -57,6 +57,8 @@ pub(super) struct Em {
     cur_pc: u64,
     /// MIMG instruction address → its sampler's S# when the code builds it from constants
     pub static_ss: BTreeMap<u64, [u32; 4]>,
+    /// loops emitted so far with a pass count of their own (`loop_guard`)
+    loop_ids: u32,
     /// the static samplers sampled with: (S#, comparison), in register order
     pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
@@ -78,21 +80,9 @@ pub(super) struct Em {
     img_writes: Vec<u64>,
     /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
     pub coherent_mem: bool,
-    /// split wave64: what lies between the basic block's previous LDS access and here
-    x64_lds: LdsGap,
-    /// first instructions of the basic blocks (branch targets, after branches)
-    block_starts: BTreeSet<u64>,
-}
-
-/// Split wave64 (`x64_lds_meet`): since the basic block's previous LDS access
-#[derive(Clone, Copy, PartialEq)]
-enum LdsGap {
-    /// that was a write or an atomic, or there was none in the block
-    Open,
-    /// that was a read, and no exchange since
-    Read,
-    /// the halves met in an exchange since
-    Met,
+    /// the program writes LDS (`writes_lds`): in the split wave64 form its LDS reads and
+    /// atomics keep the console wave's order (`xcl_x_lw`)
+    pub writes_lds: bool,
 }
 
 /// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
@@ -610,9 +600,7 @@ fn to_f16_rounded_expr(dynamic_rm: bool, e: &str) -> String {
 }
 
 impl Em {
-    /// `block_starts`: the first instructions of the program's basic blocks (branch targets and
-    /// the instructions after branches): split wave64 elides no LDS meeting across them.
-    pub fn new(opt: Options, block_starts: BTreeSet<u64>) -> Self {
+    pub fn new(opt: Options) -> Self {
         Em {
             opt,
             reductions: Default::default(),
@@ -636,6 +624,7 @@ impl Em {
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
+            loop_ids: 0,
             static_used: Vec::new(),
             max_vgpr: 0,
             has_f16_round_op: false,
@@ -646,8 +635,7 @@ impl Em {
             has_s_barrier: false,
             img_writes: Vec::new(),
             coherent_mem: false,
-            x64_lds: LdsGap::Open,
-            block_starts,
+            writes_lds: false,
         }
     }
 
@@ -1011,9 +999,6 @@ impl Em {
                 ballot = "ballot_px_local";
             }
         }
-        if ballot == "xcl_x_ballot" {
-            self.x64_met();
-        }
         match if ballot == "ballot_px" { quad_bits(a, cond, &m) } else { None } {
             Some((reads, q)) => {
                 if !reads.is_empty() {
@@ -1178,7 +1163,6 @@ impl Em {
                     self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
                     self.line(&format!("xcl_x_put(0u, {t}_m);"));
                     self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
-                    self.x64_met();
                     self.line(&format!("uint {t}_r1 = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
                     self.line(&format!("uint {t}_r2 = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
                     self.write32(&dst1, &format!("{t}_r1"));
@@ -1203,7 +1187,6 @@ impl Em {
                             self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
                             self.line(&format!("xcl_x_put(0u, {t}_m);"));
                             self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
-                            self.x64_met();
                             self.line(&format!("uint {r1} = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
                             self.line(&format!("uint {r2} = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
                             self.write32(&Dst::S(s1), &r1);
@@ -1255,7 +1238,6 @@ impl Em {
                         self.line(&format!("uint {t}_mh = WaveReadLaneAt({vh}, {lane32}u);"));
                         self.line(&format!("xcl_x_put(0u, {t}_ml); xcl_x_put(1u, {t}_mh);"));
                         self.line(&format!("bool {t}_ok = xcl_x_meet();"));
-                        self.x64_met();
                         self.line(&format!("uint {t}_ol = {t}_ok ? xcl_x_get(0u) : 0u;"));
                         self.line(&format!("uint {t}_oh = {t}_ok ? xcl_x_get(1u) : 0u;"));
                         let (h1, h2) = (l1 >> 5, l2 >> 5);
@@ -1293,9 +1275,6 @@ impl Em {
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
         self.cur_pc = d.pc;
-        if self.block_starts.contains(&d.pc) {
-            self.x64_lds = LdsGap::Open;
-        }
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
             return Flow::Jump(t);
@@ -1359,6 +1338,11 @@ impl Em {
                     }
                 } else if matches!(self.opt.mode, Mode::Kernel | Mode::Geometry(_)) {
                     self.line("GroupMemoryBarrierWithGroupSync();");
+                }
+                // split wave64: both halves made their LDS writes before the barrier (a half
+                // without a partner has nothing to wait for)
+                if self.x64() && self.writes_lds {
+                    self.line("xcl_x_lw = 0u;");
                 }
                 Flow::Next
             }
@@ -1642,9 +1626,11 @@ impl Em {
             return Err("indirect branch");
         }
         if name == "s_getpc_b64" {
-            // the code region is addressed from 0 in this model
+            // the code region is addressed from 0 in this model – with constant data after the
+            // program and several memory windows, above them all (`rodata_loader`)
             let pc = d.pc + d.len as u64;
-            self.write64(&dst, &hex(pc as u32), "0u");
+            let hi = if self.opt.rodata.is_empty() || self.opt.mem_windows <= 1 { "0u".to_string() } else { hex(super::CODE_ADDRESS_HI) };
+            self.write64(&dst, &hex(pc as u32), &hi);
             return Ok(());
         }
         if matches!(name, "s_bitset0_b64" | "s_bitset1_b64") {
@@ -2008,18 +1994,20 @@ impl Em {
             } else {
                 self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
             }
+            // (with constant data in the code, which `s_load` reads too: `rodata_loader`)
+            let load = if self.opt.rodata.is_empty() { "mem.Load" } else { "xcl_gload" };
             match count {
                 1 => {
-                    self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
+                    self.line(&format!("uint {t}_0 = {load}({t}_a);"));
                     vals.push(format!("{t}_0"));
                 }
                 2 => {
-                    self.line(&format!("uint2 {t}_g0 = mem.Load2({t}_a);"));
+                    self.line(&format!("uint2 {t}_g0 = {load}2({t}_a);"));
                     vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
                 }
                 _ => {
                     for g in 0..count / 4 {
-                        self.line(&format!("uint4 {t}_g{g} = mem.Load4({t}_a + {}u);", 16 * g));
+                        self.line(&format!("uint4 {t}_g{g} = {load}4({t}_a + {}u);", 16 * g));
                         vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
                     }
                 }
@@ -2035,7 +2023,6 @@ impl Em {
             }
             let get: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!("{v} = xcl_x_get({i}u);")).collect();
             self.line(&format!("if (xcl_x_meet() && xcl_half != 0u) {{ {} }}", get.join(" ")));
-            self.x64_met();
         }
         for (i, v) in vals.iter().enumerate() {
             let s = self.sreg(sdata + i as u64);
@@ -2424,7 +2411,7 @@ impl Em {
             (Mode::Mesh(_), 12) => {
                 for c in 0..4 {
                     if enabled(c) {
-                        st.push(format!("res.Store((xcl_vtx + {c}u) * 4u, {});", Self::exp_comp(srcs, compr, c)));
+                        st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {c}u) * 4u, {});", Self::exp_comp(srcs, compr, c)));
                     }
                 }
             }
@@ -2441,12 +2428,12 @@ impl Em {
                 for j in at {
                     for c in 0..4 {
                         if enabled(c) {
-                            st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (j + 1) + c, Self::exp_comp(srcs, compr, c)));
+                            st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (j + 1) + c, Self::exp_comp(srcs, compr, c)));
                         }
                     }
                 }
             }
-            (Mode::Mesh(_), 20) => st.push(format!("res.Store(xcl_prm * 4u, {});", srcs[0])),
+            (Mode::Mesh(_), 20) => st.push(format!("if (xcl_pok) res.Store(xcl_prm * 4u, {});", srcs[0])),
             (Mode::Mesh(_), 9) => {}
             _ => return Err("export target"),
         }
@@ -2599,7 +2586,12 @@ impl Em {
             };
             self.line(&format!("uint64_t {a} = ((((uint64_t)({d1} & 0xFFu) << 32) | (uint64_t){d0}) << 8) + {off};"));
             self.window_read(&format!("(uint)({a} >> 32)"));
-            self.line(&format!("uint4 {t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
+            let intersect = format!("bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u)");
+            if self.opt.mem_windows > 1 {
+                self.line(&format!("uint4 {t}; if (xcl_w < {}u) {{ {t} = {intersect}; }} else if (({node} & 7u) < 4u) {{ {t} = uint4(0x7f800000u, 0x3f800000u, 0u, 0u); }} else {{ {t} = 0xffffffffu; }}", self.opt.mem_windows));
+            } else {
+                self.line(&format!("uint4 {t} = {intersect};"));
+            }
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             return Ok(());
@@ -4136,7 +4128,6 @@ impl Em {
                 let rla = self.rla_uniform_fn();
                 // (a live lane of EXEC where there is one: `first_lane_live`)
                 self.line(&format!("uint {t} = {rla}({a}, first_lane_live({el}, {eh}));"));
-                self.x64_met();
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -4168,8 +4159,6 @@ impl Em {
                     }
                     _ => self.line(&format!("uint {t} = {read};")),
                 }
-                // split wave64 (no `upper` there): the last arm, an exchange
-                self.x64_met();
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -4476,7 +4465,9 @@ impl Em {
                 st.push(format!("mem.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
             } else {
                 let v = self.vreg(f("VDST") + i);
-                st.push(format!("{v} = mem.Load(({t}_a + {}u) & ~3u);", 4 * i));
+                // (with constant data in the code: `rodata_loader`)
+                let load = if self.opt.rodata.is_empty() { "mem.Load" } else { "xcl_gload" };
+                st.push(format!("{v} = {load}(({t}_a + {}u) & ~3u);", 4 * i));
             }
         }
         self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -4575,34 +4566,6 @@ impl Em {
     }
 
     /// LDS (`groupshared`, compute only) and the DS cross-lane permutes.
-    /// Split wave64: the console runs an instruction in all 64 lanes before the next, so a lane
-    /// reads the LDS the other half wrote an instruction earlier with no s_barrier – the halves
-    /// meet before every LDS access (nothing exchanged: the meeting is the order). Called once
-    /// the access is known to be translated. Not in geometry mode: ES lanes write their own
-    /// items and read no other lane's before the barrier where the phases meet.
-    /// No meeting for a read right after a read of the same basic block, nor when the halves
-    /// met in an exchange since the block's previous access (`LdsGap`). Still in order: for
-    /// accesses j < i of the stream, one a write, the halves meet between them (the access
-    /// after a write and every write meet, or an exchange lies before them; a block's first
-    /// access meets), and both halves pass the same meetings: the other half's j is done
-    /// before this half's i. Two reads need no order.
-    fn x64_lds_meet(&mut self, write: bool) {
-        if self.x64() && !matches!(self.opt.mode, Mode::Geometry(_)) {
-            if self.x64_lds == LdsGap::Open || (write && self.x64_lds == LdsGap::Read) {
-                self.line("xcl_x_meet();");
-                self.line(if self.safe_barrier { "if (xcl_x_dead) { xcl_s_barrier_exit(); return; }" } else { "if (xcl_x_dead) return;" });
-            }
-            self.x64_lds = if write { LdsGap::Open } else { LdsGap::Read };
-        }
-    }
-
-    /// An exchange (`xcl_x_meet`) the current instruction always runs, in the split form.
-    fn x64_met(&mut self) {
-        if self.x64() {
-            self.x64_lds = LdsGap::Met;
-        }
-    }
-
     fn ds(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let act = self.act();
@@ -4634,7 +4597,6 @@ impl Em {
                 self.line(&format!("uint {t}_l = (({a} + {off16}u) >> 2) & {m}u;"));
                 let rla = if self.x64() {
                     self.x64_words = 32;
-                    self.x64_met();
                     "xcl_x_rla_any"
                 } else {
                     "rla"
@@ -4663,9 +4625,25 @@ impl Em {
         if f("GDS") != 0 {
             return Err("GDS");
         }
+        // split wave64: the console runs a wave's LDS accesses in order for all 64 lanes, the
+        // halves do not – a read first meets the other half when either may have written LDS
+        // since they last met, a write when either may have read it (`xcl_x_lw`, the same in
+        // both: they run the same instructions; every meet clears it)
+        if self.x64() && self.writes_lds {
+            let (wait, set) = x64_lds_order(name);
+            if wait != 0 {
+                self.line(&format!("if ((xcl_x_lw & {wait}u) != 0u) xcl_x_meet();"));
+                // the access does not run after a rendezvous whose partner did not arrive
+                if self.x64_spin() {
+                    self.line(if self.safe_barrier { "if (xcl_x_dead) { xcl_s_barrier_exit(); return; }" } else { "if (xcl_x_dead) return;" });
+                }
+            }
+            if set != 0 {
+                self.line(&format!("xcl_x_lw |= {set}u;"));
+            }
+        }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
-            self.x64_lds_meet(name == "ds_write_addtid_b32");
             self.uses_lds = true;
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
@@ -4730,7 +4708,6 @@ impl Em {
         };
         // d16 8 / 16-bit LDS accesses (half of the VGPR)
         if let Some((bits, signed, write, half)) = ds_d16(name) {
-            self.x64_lds_meet(write);
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4756,7 +4733,6 @@ impl Em {
             _ => None,
         };
         if let Some((bits, signed, write)) = small {
-            self.x64_lds_meet(write);
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4778,7 +4754,6 @@ impl Em {
             return Ok(());
         }
         if let Some((write, n, stride, two)) = rw(name) {
-            self.x64_lds_meet(write);
             let addrs: Vec<String> = if two {
                 vec![format!("{a} + {}u", o0 * stride), format!("{a} + {}u", o1 * stride)]
             } else {
@@ -4811,7 +4786,6 @@ impl Em {
         };
         // two exchanges (ds_wrxchg2(st64)_rtn_b32): old values to VDST, VDST + 1
         if op == "wrxchg2_b32" || op == "wrxchg2st64_b32" {
-            self.x64_lds_meet(true);
             let stride = if op == "wrxchg2_b32" { 4 } else { 256 };
             let (s0, s1) = (lds(format!("{a} + {}u", o0 * stride)), lds(format!("{a} + {}u", o1 * stride)));
             let (v0, v1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
@@ -4827,7 +4801,6 @@ impl Em {
         let (v, v2) = if op.starts_with("cmpst_") { (d1, d0) } else { (d0, d1) };
         let slot = lds(format!("{a} + {off16}u"));
         let body = rmw32(&op, &At::Ref(slot), &v, &v2, &format!("{t}_o"), &t).ok_or("DS")?;
-        self.x64_lds_meet(true);
         self.line(&format!("uint {t}_o = 0u; if ({act}) {{ {body} }}"));
         if rtn {
             let r = self.vreg(f("VDST"));
@@ -4944,6 +4917,19 @@ impl Em {
         h.push_str("    xcl_xn = XCL_X_THREADS > ((xcl_tid & ~31u) ^ 32u) ? min(32u, XCL_X_THREADS - ((xcl_tid & ~31u) ^ 32u)) : 0u;\n");
     }
 
+    /// What goes before a loop and at its top (`LOOP_GUARD`). In a compute program every entry
+    /// of a loop also has its own count of passes, `xcl_cap`: 65 536, or the share of
+    /// `DISPATCH_LOOP_PASSES` the dispatch gives a lane (`IO_LOOP_BUDGET`). A loop that runs
+    /// away alone ends there; loops inside one another keep the lane's whole budget.
+    pub fn loop_guard(&mut self) -> (String, String) {
+        if !matches!(self.opt.mode, Mode::Compute(_)) {
+            return (String::new(), super::LOOP_GUARD.to_string());
+        }
+        self.loop_ids += 1;
+        let n = format!("xcl_n{}", self.loop_ids);
+        (format!("uint {n}{LOOP_CAP_INIT}"), format!("if ({n} == 0u) break; {n}--; {}", super::LOOP_GUARD))
+    }
+
     pub fn finish(&self, body: &str) -> String {
         let mut h = String::new();
         h.push_str("// generated by XCL (RDNA2 -> HLSL), do not edit\n");
@@ -4969,12 +4955,18 @@ impl Em {
         } else {
             h.push_str(LOADX4_ONE_WINDOW);
         }
+        h.push_str(&rodata_loader(&self.opt.rodata, windows > 1));
         for (i, (_, cmp)) in self.static_used.iter().enumerate() {
             let k = self.opt.static_sampler_base as usize + i;
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
         h.push_str(PRELUDE);
+        if body.contains(LOOP_CAP_INIT) {
+            h.push_str("// loop passes one entry of a loop may run (`Em::loop_guard`)
+static uint xcl_cap = 1u << 16;
+");
+        }
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);
         }
@@ -5159,16 +5151,37 @@ impl Em {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 load_sgprs(&mut h);
+                // a folded dispatch (`IO_GROUP_LIMIT`): the console's group in X, the groups
+                // past its count left out (the whole group returns)
+                let _ = writeln!(
+                    h,
+                    "    uint3 xcl_gid = gid;\n    {{\n        uint xcl_gl = io.Load({}u);\n        if (xcl_gl != 0u) {{\n            uint xcl_f = gid.x + gid.y * {}u;\n            if (xcl_f >= xcl_gl) return;\n            xcl_gid = uint3(xcl_f, 0u, gid.z);\n        }}\n    }}",
+                    super::IO_GROUP_LIMIT * 4,
+                    super::FOLD_X
+                );
+                // a program with a loop: the dispatch's share of loop passes for a group
+                // (`IO_LOOP_BUDGET`, 0 = not known) among its threads
+                if body.contains(LOOP_CAP_INIT) {
+                    let _ = writeln!(
+                        h,
+                        "    {{ uint xcl_gb = io.Load({}u); if (xcl_gb != 0u) xcl_cap = clamp(xcl_gb / {}u, {}u, 1u << 16); }}",
+                        super::IO_LOOP_BUDGET * 4,
+                        x * y * z,
+                        super::DISPATCH_LOOP_PASSES_MIN
+                    );
+                }
                 // system SGPRs after the user data: enabled group ids, then TG_SIZE
                 let mut next = cs.user_sgprs as u64;
                 for (k, c) in ["x", "y", "z"].iter().enumerate() {
                     if cs.tgid[k] {
                         if sg.contains(&next) {
+                            // the console's group: unfolded (`xcl_gid`), and of a wave-local
+                            // remap's hardware groups the one they share
                             let div = match remap {
                                 Some((ratio, dim, _)) if ["x", "y", "z"][dim] == *c => format!(" / {ratio}u"),
                                 _ => String::new(),
                             };
-                            let _ = writeln!(h, "    {} = gid.{c}{div};", sname(next).unwrap());
+                            let _ = writeln!(h, "    {} = xcl_gid.{c}{div};", sname(next).unwrap());
                         }
                         next += 1;
                     }
@@ -5177,27 +5190,38 @@ impl Em {
                     // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
-                h.push_str("    bool xcl_dispatch_limited = false;\n");
-                for (k, c) in ["x", "y", "z"].iter().enumerate().filter(|(k, _)| cs.threads[*k] > 1) {
-                    let slot = super::IO_THREAD_LIMIT[k] * 4;
-                    let _ = writeln!(h, "    uint xcl_limit_{c} = io.Load({slot}u);\n    xcl_dispatch_limited = xcl_dispatch_limited || xcl_limit_{c} != 0u;");
-                }
-                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0;");
-                // The limits are uniform I/O values. Make that explicit so a split-wave
-                // rendezvous is not compiled inside lane-divergent control flow.
-                let _ = writeln!(h, "        if (WaveActiveAllTrue(xcl_dispatch_limited)) {{\n            bool xcl_dispatch_live = true;");
-                for (k, c) in ["x", "y", "z"].iter().enumerate().filter(|(k, _)| cs.threads[*k] > 1) {
-                    let group = match remap {
-                        Some((ratio, dim, _)) if dim == k => format!("(gid.{c} / {ratio}u)"),
-                        _ => format!("gid.{c}"),
-                    };
-                    let threads = cs.threads[k];
-                    let _ = writeln!(h, "            xcl_dispatch_live = xcl_dispatch_live && (xcl_limit_{c} == 0u || {group} * {threads}u + gtid.{c} < xcl_limit_{c});");
-                }
-                let ballot = self.ballot_fn();
-                let _ = writeln!(h, "            e0 = {ballot}(xcl_dispatch_live);\n        }} else {{\n            e0 = {ballot}(true);\n        }}\n        exec_lo = e0.x; exec_hi = e0.y; }}");
+                // a dispatch with thread dimensions (`IO_THREAD_LIMIT`): a lane whose thread
+                // (the console's group, unfolded, times the group size plus its thread in the
+                // group) is at or past an axis's count is not in EXEC, as the console never
+                // starts it. A count of 0 (no limit) less 1 passes every thread: one load and a
+                // compare an axis, no branch (so no split-wave exchange inside lane-divergent
+                // control flow), the same EXEC as before for every other dispatch. A wave-local
+                // remap's hardware groups share their console group (`gid / ratio` on its axis;
+                // `gtid` is already the console thread)
+                let cg = match remap {
+                    Some((ratio, dim, _)) => {
+                        let d = ["x", "y", "z"][dim];
+                        format!("uint3 xcl_cg = xcl_gid; xcl_cg.{d} /= {ratio}u;")
+                    }
+                    None => "uint3 xcl_cg = xcl_gid;".to_string(),
+                };
+                let _ = writeln!(
+                    h,
+                    "    uint scc = 0u;\n    {{\n        uint3 xcl_tl = io.Load3({}u) - 1u;\n        {cg}\n        uint2 e0 = {}(all(xcl_cg * uint3({x}u, {y}u, {z}u) + gtid <= xcl_tl));\n        exec_lo = e0.x; exec_hi = e0.y;\n    }}",
+                    super::IO_THREAD_LIMIT[0] * 4,
+                    self.ballot_fn()
+                );
+                // the entry ballot is an exchange of the split form: a pair whose partner did not
+                // arrive stops there (`x64_fail_closed_since`)
                 if self.x64() && self.x64_spin() {
                     h.push_str(if self.safe_barrier { "    if (xcl_x_dead) { xcl_s_barrier_exit(); return; }\n" } else { "    if (xcl_x_dead) return;\n" });
+                }
+                // a wave with no thread left (past the count in a group of several waves) is one
+                // the console does not start: it leaves (from the early-exit-safe barrier too),
+                // but not where a plain group barrier would wait for it
+                if !body.contains("GroupMemoryBarrierWithGroupSync") {
+                    let leave = if self.safe_barrier { "xcl_s_barrier_exit(); " } else { "" };
+                    let _ = writeln!(h, "    if ((exec_lo | exec_hi) == 0u) {{ {leave}return; }}");
                 }
                 for &v in &self.vgprs {
                     let init = match v {
@@ -5239,6 +5263,14 @@ impl Em {
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", ms.record_dwords());
                 let _ = writeln!(h, "    uint xcl_vtx = xcl_rec + {MESH_HEADER}u + xcl_slot * {}u;", ms.vert_dwords());
                 let _ = writeln!(h, "    uint xcl_prm = xcl_rec + {}u + xcl_slot;", MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords());
+                // A record has room for `max_vertices` vertices and `max_primitives` primitives; a
+                // thread past either exports nothing (the console's hardware drops an export past
+                // what the program asked room for). `res` is a root UAV: nothing bounds a store
+                // there, and one past the last record of the buffer is a store to an unmapped
+                // address (a retail title's first frames with mesh programs lost the device to a
+                // shader's access to unmapped memory on five shader units at once).
+                let _ = writeln!(h, "    bool xcl_vok = xcl_slot < {}u;", ms.max_vertices);
+                let _ = writeln!(h, "    bool xcl_pok = xcl_slot < {}u;", ms.max_primitives);
                 load_sgprs(&mut h);
                 if sg.contains(&3) {
                     h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");
@@ -5248,7 +5280,11 @@ impl Em {
                     h.push_str(if self.safe_barrier { "    if (xcl_x_dead) { xcl_s_barrier_exit(); return; }\n" } else { "    if (xcl_x_dead) return;\n" });
                 }
                 for &v in &self.vgprs {
-                    let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
+                    let init = if v == 5 {
+                        format!("(gid.x + io.Load({}u)) * {t}u + xcl_slot", super::IO_MESH_GROUP_BASE * 4)
+                    } else {
+                        "0u".into()
+                    };
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
                 h.push_str(body);
@@ -5900,6 +5936,34 @@ fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -
 /// Placeholder where the memory window accessors go (after the `mem` declarations).
 const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 
+/// `Options::rodata`: the program's constant data as an array of the shader, and the dword
+/// loads of `s_load` and FLAT / GLOBAL instructions that read it – a code address
+/// (`s_getpc_b64` plus the compiler's offset: `CODE_ADDRESS_HI` with several memory windows,
+/// the program's offset with one) inside one of the blocks gives the block's dword, any other
+/// address the memory's. Nothing without data.
+fn rodata_loader(rodata: &[(u32, Vec<u32>)], windows: bool) -> String {
+    let total: usize = rodata.iter().map(|b| b.1.len()).sum();
+    if total == 0 {
+        return String::new();
+    }
+    let words: Vec<String> = rodata.iter().flat_map(|b| b.1.iter()).map(|w| format!("0x{w:08X}u")).collect();
+    let mut s = format!("static const uint xcl_rodata[{total}] = {{ {} }};\nuint xcl_gload(uint a) {{\n", words.join(", "));
+    let w0 = if windows { format!("xcl_w == {:#X}u - xcl_uma_base && ", super::CODE_ADDRESS_HI) } else { String::new() };
+    let mut first = 0usize;
+    let mut inside = Vec::new();
+    for (at, block) in rodata.iter().filter(|b| !b.1.is_empty()) {
+        let _ = writeln!(s, "    [branch] if ({w0}a - {at}u < {}u) {{ return xcl_rodata[{first}u + ((a - {at}u) >> 2)]; }}", 4 * block.len());
+        inside.push(format!("a - {at}u < {}u", 4 * block.len()));
+        first += block.len();
+    }
+    s.push_str("    return mem.Load(a);\n}\n");
+    // several dwords from `a` (`s_load_dwordx2` and up): one look at the address for all of them
+    let inside = format!("{w0}({})", inside.join(" || "));
+    let _ = writeln!(s, "uint2 xcl_gload2(uint a) {{ [branch] if ({inside}) {{ return uint2(xcl_gload(a), xcl_gload(a + 4u)); }} return mem.Load2(a); }}");
+    let _ = writeln!(s, "uint4 xcl_gload4(uint a) {{ [branch] if ({inside}) {{ return uint4(xcl_gload(a), xcl_gload(a + 4u), xcl_gload(a + 8u), xcl_gload(a + 12u)); }} return mem.Load4(a); }}");
+    s
+}
+
 /// Four dwords at four addresses (scalar buffer loads with their bounds checks); with several
 /// windows `mem_accessors` defines it, with one switch for all four.
 const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }\n";
@@ -6287,6 +6351,46 @@ pub(super) fn x64_spin_for(threads: u32, env: Option<&str>) -> bool {
     threads > 64 || env.is_some_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
+/// `xcl_x_lw` bits: LDS written, LDS read since the halves last met.
+pub(crate) const LDS_WROTE: u32 = 1;
+pub(crate) const LDS_READ: u32 = 2;
+
+/// Split wave64: how the LDS instruction `name` (lower case) keeps the console wave's order of
+/// LDS accesses across its halves (`xcl_x_lw`): (the bits after which it meets the other half
+/// first, the bits it sets). A load waits for the other half's earlier writes, a store for its
+/// earlier reads (on the console every lane reads before any lane of a later instruction
+/// writes), an atomic (and the `src2` forms, which read LDS too) for both; the cross-lane DS
+/// forms touch no LDS. A store does not wait for the other half's earlier stores.
+pub(crate) fn x64_lds_order(name: &str) -> (u32, u32) {
+    if matches!(name, "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32" | "ds_nop") || !name.starts_with("ds_") {
+        (0, 0)
+    } else if name.starts_with("ds_read") {
+        (LDS_WROTE, LDS_READ)
+    } else if name.starts_with("ds_write") && !name.contains("src2") {
+        (LDS_READ, LDS_WROTE)
+    } else {
+        (LDS_WROTE | LDS_READ, LDS_WROTE | LDS_READ)
+    }
+}
+
+/// Whether the program writes LDS (`x64_lds_order`): without that its split wave64 form
+/// needs no meet for the order of its LDS accesses.
+pub(crate) fn writes_lds(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| d.enc.name == "ENC_DS" && x64_lds_order(&d.inst.name.to_ascii_lowercase()).1 & LDS_WROTE != 0)
+}
+
+/// Whether the split wave64 form keeps the console wave's order of LDS accesses
+/// (`x64_lds_order`, both translators); `XCL_X_LDS_ORDER=0` leaves it out (the translated
+/// cache's identity tells the two apart).
+pub(crate) fn lds_order_wanted() -> bool {
+    lds_order_for(std::env::var("XCL_X_LDS_ORDER").ok().as_deref())
+}
+
+/// `lds_order_wanted` for the value `env` of `XCL_X_LDS_ORDER`: on unless it is `0`.
+pub(super) fn lds_order_for(env: Option<&str>) -> bool {
+    env.map_or(true, |v| v.trim() != "0")
+}
+
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
 /// per-lane code is unchanged, and the halves meet ("exchange") wherever a value has to be
 /// the whole wave's – masks, lane reads, coherent scalar loads – so both hold the same SGPRs
@@ -6303,6 +6407,10 @@ static const uint XCL_X_FAIL = 0x80000000u;
 // the other half did not arrive in time (a desynchronised pair): the generated program
 // returns after the exchange instead of consuming a placeholder value
 static bool xcl_x_dead = false;
+// LDS written (1) and read (2) since the halves last met: the next LDS read meets first after a
+// write, the next write after a read, so each sees the console wave's LDS as its in-order wave
+// does (`x64_lds_order`)
+static uint xcl_x_lw = 0u;
 // The console thread (index in the group) this hardware thread stands for. The threads of a
 // group are interchangeable, but the console forms its waves from consecutive thread
 // indices and the PC GPU need not (NVIDIA does not for 3-D groups such as 8 x 8 x 4): each
@@ -6326,6 +6434,7 @@ uint xcl_x_get(uint i) { return XCL_XS(xcl_x_at(xcl_half ^ 1u, xcl_xk - 1u) + i)
 bool xcl_x_meet() {
     uint k = xcl_xk;
     xcl_xk = k + 1u;
+    xcl_x_lw = 0u;
     if (xcl_xn == 0u) return false;
 #if XCL_X_SPIN
     // several console waves per group: a group barrier would wait for the other console
@@ -6548,6 +6657,9 @@ uint2 ballot_px_local(bool b) {
     return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
 }
 "#;
+
+/// How `Em::loop_guard` starts a loop's own pass count (and how `finish` knows of them).
+const LOOP_CAP_INIT: &str = " = xcl_cap;";
 
 const PRELUDE: &str = r#"
 static uint lane_id;
