@@ -43,13 +43,25 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     std::env::remove_var("XCL_PREPARATION_MENU");
     let root = &boot.game_root;
     let corpus = root.join(".xcl/pso-corpus").try_exists().map_err(|e| e.to_string())?;
-    if !corpus && std::env::var("XCL_PREPARE").is_ok_and(|v| v.trim() == "0") { return Ok(()); }
+    // `XCL_PREPARE=0`: the title starts at once and builds what it uses as it goes (it stands
+    // still for those builds): for a look at a change without the wait
+    if !corpus && std::env::var("XCL_PREPARE").is_ok_and(|v| v.trim() == "0") {
+        crate::xlog_info!("Shader preparation left out (XCL_PREPARE=0): the title builds what it uses as it goes");
+        return Ok(());
+    }
     let history = crate::hle::d3d12x::gfx_records::path().try_exists().map_err(|e| e.to_string())?;
     if !corpus && !history && (boot.config.graphics.eq_ignore_ascii_case("null") ||
         (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir())) {
         return Ok(());
     }
-    let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), ..Default::default() });
+    // (the shader records earlier runs of the title used go first and alone: the rest are built
+    // when the title asks for them; `XCL_PREPARE_ALL=1` prepares every record)
+    let only = Some(crate::hle::d3d12x::pso_async::earlier_used_shaders())
+        .filter(|used| !used.is_empty() && !std::env::var("XCL_PREPARE_ALL").is_ok_and(|v| v.trim() == "1"));
+    if let Some(used) = &only {
+        crate::xlog_info!("Shader preparation: only the {} shaders earlier runs used (XCL_PREPARE_ALL=1: every record)", used.len());
+    }
+    let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), only, ..Default::default() });
     let hwnd = if super::enabled() {
         *SCREEN.lock().unwrap() = Some(Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false });
         ACTIVE.store(true, Ordering::Release);

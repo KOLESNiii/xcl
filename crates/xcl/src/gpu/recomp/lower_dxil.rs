@@ -52,8 +52,8 @@ impl DxilIr {
 
     /// `new` in the split form (two hardware wave32s per console wave64): #1426's `Lw` numbers
     /// the threads as the hardware waves arrive and lays out the halves' exchange storage; its
-    /// `ballot` / `read_lane_uniform` meet the other half (a group barrier for one console
-    /// wave per group, the spin meet for more).
+    /// `ballot` / `read_lane_uniform` meet the other half (the spin meet for a compute group of
+    /// more than 32 threads, a group barrier for the kernel form).
     fn split(insts: &[Decoded], entry: &Entry) -> DxilIr {
         Self::with(insts, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, entry)
     }
@@ -306,6 +306,14 @@ impl Ir for DxilIr {
             return self.lw.read_lane_half(v, lane);
         }
         self.read_lane(v, lane)
+    }
+    fn before_lanes_leave(&mut self, threads: [u32; 3], groups: [Value; 3], last: [Value; 3]) {
+        // the split form's halves meet counting their lanes (#1426's `kernel::compute_gate`):
+        // the other half's that stay
+        if let (true, Some((tid, _))) = (self.lw.split, self.ids) {
+            let w = crate::gpu::dxil::kernel::partner_word(&mut self.lw, threads, groups, last, tid);
+            self.lw.xn = self.lw.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, w);
+        }
     }
     fn count_bits(&mut self, v: Value) -> Value {
         self.lw.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, v)
@@ -629,6 +637,63 @@ mod tests {
     }
 
     #[test]
+    fn per_lane_atomics_take_their_declared_operands() {
+        const LINES: &[I] = &[
+            ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 1), ("OFFEN", 1), ("SOFFSET", 128), ("GLC", 1)]),
+            ("BUFFER_ATOMIC_CMPSWAP", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("OFFEN", 1), ("SOFFSET", 128), ("GLC", 1)]),
+            ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 7), ("VDST", 12), ("SADDR", 0), ("OFFSET", 128), ("GLC", 1)]),
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 4)]),
+            ("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 8), ("ADDR", 1), ("DATA0", 7)]),
+            ("DS_CMPST_RTN_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 1), ("DATA0", 6), ("DATA1", 9)]),
+            ("DS_READ_B32", "ENC_DS", &[("VDST", 11), ("ADDR", 1)]),
+            ("DS_MSKOR_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 13), ("DATA1", 14)]),
+            ("DS_READ_B32", "ENC_DS", &[("VDST", 15), ("ADDR", 1)]),
+            ENDPGM,
+        ];
+        let (direct, _) = super::kernel(&decode(LINES), false).unwrap();
+        if !gpu() { return; }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let mut st = runner::KernelState::default();
+        st.sgpr[126] = u32::MAX;
+        st.sgpr[2] = 128; // raw buffer size in bytes
+        let mut mem = vec![0; 64];
+        for (i, v) in st.vgpr[..32].iter_mut().enumerate() {
+            let lane = i as u32;
+            mem[i] = 100 + lane;
+            mem[32 + i] = 200 + lane;
+            v[1] = 4 * lane;
+            v[2] = 5;
+            v[4] = 100 + lane;
+            v[5] = 500 + lane;
+            v[6] = 105 + lane;
+            v[7] = 5;
+            v[9] = 300 + lane;
+            v[13] = 15;
+            v[14] = 0x8000_0001;
+        }
+        let bytes = LINES.iter().flat_map(encode_line).collect::<Vec<_>>();
+        let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let reference = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let reference = runner::run(&reference, &st, &mem).unwrap();
+        let actual = runner::run(&direct, &st, &mem).unwrap();
+        assert_eq!(actual.mem, reference.mem);
+        for i in 0..32 {
+            let lane = i as u32;
+            assert_eq!((actual.mem[i], actual.mem[32 + i]), (500 + lane, 205 + lane));
+            for (r, expected) in [(2, 100), (5, 105), (8, 100), (10, 105), (11, 300), (12, 200)] {
+                assert_eq!(actual.vgpr[i][r], reference.vgpr[i][r]);
+                assert_eq!(actual.vgpr[i][r], expected + lane);
+            }
+            assert_eq!(actual.vgpr[i][15], reference.vgpr[i][15]);
+            assert_eq!(actual.vgpr[i][15], ((300 + lane) & !15) | 0x8000_0001);
+        }
+    }
+
+    #[test]
     fn a_branch_on_a_mixed_mask_matches_the_hlsl_path_on_the_gpu() {
         if !gpu() { return; }
         if dxc::location().is_err() {
@@ -897,7 +962,8 @@ mod tests {
             ("S_ENDPGM", "ENC_SOPP", &[]),
         ];
         // Case B: `S_CSELECT_B32` directly consumes the SCC written by `S_AND_SAVEEXEC_B64`
-        // -> split-exchange ballot MUST be emitted (+2 GROUP_SYNC barriers).
+        // -> split-exchange ballot MUST be emitted (one console wave: the spin exchange, +2
+        // groupshared fences and no group barrier).
         let live_scc = [
             ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)][..]),
             ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
@@ -919,9 +985,14 @@ mod tests {
             crate::gpu::dxil::validate::disassemble(&dxil_dead),
             crate::gpu::dxil::validate::disassemble(&dxil_live),
         ) {
-            let b_dead = dis_dead.matches("@dx.op.barrier(").count();
-            let b_live = dis_live.matches("@dx.op.barrier(").count();
-            assert_eq!(b_live, b_dead + 2, "live SCC should emit one split-exchange (+2 barriers); dead={b_dead}, live={b_live}");
+            // barrier mode 9: the group barrier with sync (`ops::barrier::GROUP_SYNC`); mode 8:
+            // the spin exchange's groupshared fences (`TGSM_FENCE`)
+            let syncs = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 9)").count();
+            let fences = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 8)").count();
+            let (s_dead, s_live) = (syncs(&dis_dead), syncs(&dis_live));
+            assert_eq!((s_dead, s_live), (1, 1), "only the start's group barrier; dead={s_dead}, live={s_live}");
+            let (f_dead, f_live) = (fences(&dis_dead), fences(&dis_live));
+            assert_eq!(f_live, f_dead + 2, "live SCC should emit one split-exchange (+2 fences); dead={f_dead}, live={f_live}");
         }
         if gpu() {
             for dxil in [&dxil_dead, &dxil_live] {
@@ -1144,9 +1215,10 @@ mod tests {
 
     /// A float compare bridged to #1426's lowering in a block only the lower half of a split
     /// wave64 group reaches (Pipodi's point 5 on #1745): a nested `if` whose condition goes to
-    /// `s_and_saveexec`. #1426 would ballot the compare's mask through an exchange, a group
-    /// barrier the upper half never reaches. The bridge reads back only each lane's bit, so this
-    /// half's ballot is enough, and the only barrier left is the one at the start.
+    /// `s_and_saveexec`. #1426 would ballot the compare's mask through an exchange the upper half
+    /// never reaches. The bridge reads back only each lane's bit, so this half's ballot is
+    /// enough: the only barrier left is the one at the start, and the only exchange the outer
+    /// branch's.
     #[test]
     fn a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier() {
         let lines: &[I] = &[
@@ -1169,16 +1241,29 @@ mod tests {
             ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
             ENDPGM,
         ];
-        // one console wave per group: the halves meet at a group barrier (`Partner::Present`)
+        // one console wave per group: the halves exchange through group-shared counters
+        // (`Partner::Spin`), each exchange between two groupshared fences
         let cs = compute_cs();
         let dxil = super::compute_split(&decode(lines), &cs).unwrap_or_else(|e| panic!("{e}"));
         if dxc::location().is_err() {
             return runner::skip_test("no DXC");
         }
         let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
+        // barrier mode 9: the group barrier with sync; mode 8: the spin exchange's fences
+        let barriers = text.lines().filter(|l| l.contains("call void @dx.op.barrier(i32 80, i32 9)")).count();
+        let fences = text.lines().filter(|l| l.contains("call void @dx.op.barrier(i32 80, i32 8)")).count();
+        // the one where the halves take their console lanes, at the start (every lane is there)
+        assert_eq!(barriers, 1, "group barriers in the program:\n{text}");
+        // one exchange: the outer `s_and_saveexec`'s EXEC, which both halves reach; none in the
+        // block only the lower half reaches
+        assert_eq!(fences, 2, "spin exchanges' fences in the program:\n{text}");
+        // and no barrier of another mode
+        let all = text.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
+        assert_eq!(all, barriers + fences, "a barrier of another mode in the program:\n{text}");
         let (_, after_entry) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
-        let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
-        // after the entry whole-wave branch, only one half reaches the body so no group barrier may appear there
+        let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier(i32 80, i32 9)")).count();
+        // after the entry whole-wave branch, only one half reaches the body so no group barrier may
+        // appear there (the spin exchange's fences, mode 8, wait for no other thread)
         assert_eq!(divergent_barriers, 0, "group barriers after entry branch:\n{text}");
         if !gpu() {
             return;

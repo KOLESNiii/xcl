@@ -846,7 +846,9 @@ struct ShadersOptions {
     recomp: bool,
     iface: bool,
     example: Option<String>,
-    windows: u32,
+    /// `--windows`; None: the runtime's count for `--precompile` / `--export-hlsl` /
+    /// `--measure-pso` (`configured_runtime_windows`), 4 for `--direct`
+    windows: Option<u32>,
     split: Option<bool>,
     export_hlsl: Option<PathBuf>,
     min_kb: usize,
@@ -887,7 +889,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         recomp: false,
         iface: false,
         example: None,
-        windows: 4,
+        windows: None,
         split: None,
         export_hlsl: None,
         min_kb: 1024,
@@ -929,7 +931,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--example" => opts.example = Some(p.value("--example")?.to_string()),
             "--windows" => {
                 let w = p.parse_usize("--windows")?;
-                opts.windows = u32::try_from(w).map_err(|_| format!("invalid value for --windows: {w}"))?;
+                opts.windows = Some(u32::try_from(w).map_err(|_| format!("invalid value for --windows: {w}"))?);
             }
             "--split" => opts.split = Some(p.parse_bool_01("--split")?),
             "--export-hlsl" => opts.export_hlsl = Some(PathBuf::from(p.value("--export-hlsl")?)),
@@ -1051,7 +1053,18 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
         };
     }
-    let runtime_windows = || runtime_windows(opts.windows);
+    // the runtime's memory windows: as many as a run has (`XCL_UMA_WINDOWS`) unless `--windows`
+    // says, as its shaders take them (`runtime_windows`), as `--precompile`
+    let runtime_windows = {
+        let windows = opts.windows.map_or_else(crate::gpu::uma::configured_runtime_windows, |w| w as usize);
+        let heap = windows > 1 && recomp::pso::heap_windows();
+        if !recomp::valid_window_count(windows, heap) {
+            eprintln!("xcl shaders: --windows {windows}: 1 to 4, or 8 or 16 with XCL_HEAP_WINDOWS=1");
+            return 2;
+        }
+        let windows = windows as u32;
+        move || runtime_windows(windows)
+    };
     if opts.graphics_records {
         return graphics_worker(path, runtime_windows(), opts.threads);
     }
@@ -2563,6 +2576,10 @@ pub(crate) struct LaunchPreparation {
     pub graphics: std::sync::atomic::AtomicBool,
     /// While replaying the discovered corpus, only verified native successes advance `done`.
     pub corpus: std::sync::atomic::AtomicBool,
+    /// The shaders earlier runs used (`pso_async::earlier_used_shaders`), when there are any:
+    /// only their records are translated before the title starts, and it translates another
+    /// when it first uses it. `XCL_PREPARE_ALL=1`: every record, as without the list.
+    pub only: Option<HashSet<u64>>,
 }
 
 impl LaunchPreparation {
@@ -2803,82 +2820,40 @@ fn progress_count(line: &str) -> Option<usize> {
     d.parse().ok()
 }
 
-/// A pipeline one process builds: a file beside the driver blob it will write (`<blob>.claim`),
-/// made when the build starts and gone when it ends. A second process that finds it leaves the
-/// pipeline to the first. One left behind by a process that died is taken over after `STALE`.
-struct WorkerClaim(PathBuf);
-
-impl WorkerClaim {
-    const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-    /// None: another process has it.
-    fn take(blob: &std::path::Path) -> Option<WorkerClaim> {
-        let mut name = blob.as_os_str().to_owned();
-        name.push(".claim");
-        let path = PathBuf::from(name);
-        let make = || std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
-        match make() {
-            Ok(_) => Some(WorkerClaim(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let old = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Self::STALE);
-                (old && std::fs::remove_file(&path).is_ok() && make().is_ok()).then(|| WorkerClaim(path))
-            }
-            // (the folder cannot be written: nothing is shared through it either)
-            Err(_) => Some(WorkerClaim(PathBuf::new())),
-        }
-    }
-}
-
-impl Drop for WorkerClaim {
-    fn drop(&mut self) {
-        if !self.0.as_os_str().is_empty() {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-}
-
-#[cfg(test)]
-mod claim_tests {
-    use super::WorkerClaim;
-
-    /// The first process to ask builds a pipeline, a second one leaves it, and it is free again
-    /// when the first is done.
-    #[test]
-    fn a_pipeline_is_claimed_by_one_builder_at_a_time() {
-        let dir = std::env::temp_dir().join(format!("xcl-claim-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let blob = dir.join("0123.pso");
-        let first = WorkerClaim::take(&blob).expect("free");
-        assert!(dir.join("0123.pso.claim").exists());
-        assert!(WorkerClaim::take(&blob).is_none(), "claimed");
-        assert!(WorkerClaim::take(&dir.join("4567.pso")).is_some(), "another pipeline is free");
-        drop(first);
-        assert!(!dir.join("0123.pso.claim").exists());
-        assert!(WorkerClaim::take(&blob).is_some(), "free again");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// The compute pipelines of `pack` built by `workers` processes of this program, each on its own
 /// slice of the records (`XCL_PRECOMPILE_SLICE`). A failed worker prevents guest entry.
 fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation,
                         coverage: Option<&ComputeCoverage>) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let series_s = crate::hle::d3d12x::pso_async::profile_is_series_s();
     let map = coverage.map(|c| c.slice_file()).transpose()?.flatten();
+    // only the pipelines an earlier run of the title used, when that list exists and the title's
+    // shaders are limited to those an earlier run used (`LaunchPreparation::only`; the title
+    // builds another when it first uses it)
+    let used_only = progress.only.is_some() && !crate::hle::d3d12x::pso_async::earlier_used_keys().is_empty();
     let t0 = std::time::Instant::now();
-    crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes");
+    crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes{}", if used_only { ", those an earlier run used" } else { "" });
     let (cancelled, failed, _) = in_workers(workers, records, progress, |i| {
-        let mut c = worker_command(&me);
+        let mut c = pipeline_worker_command(&me, pack, windows, used_only, &format!("{i}/{workers}"), series_s);
         if let Some((file, dir)) = &map { c.env(COVERAGE_MAP, &file.0).env(COVERAGE_DIR, dir); }
-        c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
         if std::env::var_os("XCL_ADAPTER").is_none() && !progress.adapter.is_empty() { c.env("XCL_ADAPTER", &progress.adapter); }
-        c.env("XCL_PRECOMPILE_SLICE", format!("{i}/{workers}"));
         c
     });
     if cancelled { return Err("Shader preparation cancelled".into()); }
     if failed != 0 { return Err(format!("{failed} of {workers} compute pipeline workers failed")); }
     crate::xlog_info!("Shader preparation: compute pipelines done in {:.0} s ({failed} of {workers} workers failed)", t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// Compute pipeline worker `slice` (`i/n`) of `pack`, with the console profile: the worker reads
+/// that profile's used-pipeline list (`used_pipelines_name`).
+fn pipeline_worker_command(me: &Path, pack: &Path, windows: u32, used_only: bool, slice: &str, series_s: bool) -> std::process::Command {
+    let mut c = worker_command(me);
+    c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
+    if used_only { c.arg("--used-only"); }
+    c.env("XCL_PRECOMPILE_SLICE", slice);
+    c.env("XCL_DEVICE_TYPE", if series_s { "lockhart" } else { "anaconda" });
+    c
 }
 
 /// A preparation worker: this program, not a host and not a launcher's child, a builder that
@@ -3513,6 +3488,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
+                if startup.and_then(|p| p.only.as_ref()).is_some_and(|used| !used.contains(&crate::hle::d3d12x::real::shader_key(&blob))) {
+                    record_done();
+                    continue;
+                }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
@@ -3588,7 +3567,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
                         let t = match recomp::translate(code, &opt) {
                             Ok(t) if t.complete() => t,
                             Ok(_) => {
@@ -4243,6 +4222,18 @@ mod tests {
         assert!(!super::used_indirect_split(&b, &indirect));
     }
 
+    #[test]
+    fn pipeline_worker_command_forwards_console_profile() {
+        let dev_env = |series_s| {
+            let cmd = super::pipeline_worker_command(Path::new("xcl.exe"), Path::new("shaders.rpf"), 4, false, "0/2", series_s);
+            cmd.get_envs()
+                .find_map(|(k, v)| (k == std::ffi::OsStr::new("XCL_DEVICE_TYPE")).then(|| v.map(|s| s.to_string_lossy().into_owned())))
+                .flatten()
+        };
+        assert_eq!(dev_env(true).as_deref(), Some("lockhart"));
+        assert_eq!(dev_env(false).as_deref(), Some("anaconda"));
+    }
+
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
 
@@ -4502,7 +4493,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     let seed = opts.seed;
     let validate = opts.validate;
     let compare = opts.compare;
-    let windows = opts.windows;
+    let windows = opts.windows.unwrap_or(4);
     let split = opts.split.unwrap_or(true);
     // records hold one or more programs: sample records, stop at `want` programs
     let order = coverage::sample_indices(input.len(), want, seed);
@@ -4573,9 +4564,9 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                         let t = std::time::Instant::now();
                         let r = {
                             let (tx, rx) = std::sync::mpsc::channel();
-                            let (c, m) = (code.to_vec(), mode.clone());
+                            let (c, m, rodata) = (code.to_vec(), mode.clone(), f.rodata(p));
                             std::thread::spawn(move || {
-                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
+                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate, &rodata));
                             });
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
@@ -4617,7 +4608,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                                     recomp::Mode::Pixel(_) => "ps_6_6",
                                     _ => "cs_6_6",
                                 };
-                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, ..Default::default() };
+                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
                                 let t = recomp::translate(code, &opt).ok().filter(|t| t.complete())?;
                                 dump("hlsl", t.hlsl.as_bytes());
                                 let d = recomp::dxc::compile(&t.hlsl, "main", profile, &[]).ok()?;
