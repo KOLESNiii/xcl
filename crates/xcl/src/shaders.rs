@@ -35,6 +35,7 @@ fn warm_settings(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::O
             "XCL_PRECOMPILE_PARENT" | "XCL_PREPARATION_PARENT" | "XCL_PREPARATION_MENU" |
             "XCL_PRECOMPILE_SLICE" | "XCL_PRECOMPILE_COVERAGE_MAP" | "XCL_PRECOMPILE_COVERAGE_DIR" |
             "XCL_DXC_THREADS" | "XCL_PIPELINE_THREADS" | "XCL_PREPARE_WORKERS" | "XCL_PIPELINE_LIBRARY_OUT" | "XCL_PREPARE" |
+            "XCL_PREPARE_HISTORY_PRESENT" | "XCL_PREPARE_HISTORY_SECONDS" |
             "XCL_PREPARE_GRAPHICS" | "XCL_PREPARE_ALL_LIVE" | "XCL_RUN_SECONDS" | "XCL_PRESS_AT" |
             "XCL_PRESS_AFTER_POLL" | "XCL_ACTIVITY" | "XCL_SKIP_BINK" | "XCL_FRAME_DUMP" |
             "XCL_FRAME_DUMP_FULL" | "XCL_GPU_CULPRIT" | "XCL_DSTORAGE_LATE_PAGE_MS" | "XCL_DISPATCH_TILE_AXIS") {
@@ -2622,6 +2623,17 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
         }
     }
     let corpus = pso_corpus::discover(root)?;
+    let cutoff = std::env::var("XCL_PREPARE_HISTORY_PRESENT").ok();
+    let seconds = std::env::var("XCL_PREPARE_HISTORY_SECONDS").ok();
+    if let Some(options) = milestone::launch_options(cutoff.as_deref(), seconds.as_deref())? {
+        let inputs = title_inputs(root)?;
+        if inputs.is_empty() { return Err("No shader records are available for history preparation".into()) }
+        let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
+        if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
+        let manifest = crate::gpu::recomp::dxc::cache_dir().join("pso-manifest.txt");
+        milestone::prepare_launch(&inputs, &manifest, &options, windows, &progress.adapter, progress)?;
+        return Ok(());
+    }
     prepare_title_inputs(root, progress, corpus.as_ref())?;
     if let Some(corpus) = corpus {
         corpus.prepare(progress)?;
@@ -2630,7 +2642,7 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     Ok(())
 }
 
-fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Option<&pso_corpus::Corpus>) -> Result<(), String> {
+fn title_inputs(root: &Path) -> Result<Vec<Input>, String> {
     let mut inputs = Vec::new();
     let pack = root.join("shaders.rpf");
     if pack.try_exists().map_err(|e| e.to_string())? {
@@ -2646,6 +2658,12 @@ fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Optio
         loose_inputs(&loose, &mut files).map_err(|e| format!("Reading {}: {e}", loose.display()))?;
         if !files.is_empty() { inputs.push(Input::Files(files)); }
     }
+    Ok(inputs)
+}
+
+fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Option<&pso_corpus::Corpus>) -> Result<(), String> {
+    let inputs = title_inputs(root)?;
+    let pack = root.join("shaders.rpf");
     progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
     let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
     if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
