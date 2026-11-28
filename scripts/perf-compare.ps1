@@ -359,6 +359,7 @@ for ($i = 0; $i -lt 2; $i++) {
     if ([long]$beforeRun.duration_requested_seconds -ne [long]$afterRun.duration_requested_seconds) {
         throw "$($beforeRun.cache_state) requested duration differs; runs are incomparable"
     }
+    Require-Same-Property $beforeRun $afterRun 'startup_timeout_seconds' "$($beforeRun.cache_state) startup timeout"
     $beforeDuration = Number-Or-Null $beforeRun 'duration_actual_ms'
     $afterDuration = Number-Or-Null $afterRun 'duration_actual_ms'
     $beforeStalls = Read-Stalls $baselineRoot ($i + 1) $beforeRun.cache_state
