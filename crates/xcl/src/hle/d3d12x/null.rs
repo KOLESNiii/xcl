@@ -386,6 +386,8 @@ pub unsafe fn capture_stream_desc(desc: *const u8) {
     if !crate::gpu::shader::readable(base, size) {
         return;
     }
+    let buf = super::real::pc_numbered(std::slice::from_raw_parts(base as *const u8, size));
+    let (base, size) = (buf.as_ptr() as usize, buf.len());
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = *((base + off) as *const u32);
