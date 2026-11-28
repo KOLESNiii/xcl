@@ -5,9 +5,24 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 const HEADER: &str = "# xcl pso manifest v1: ";
 const MAX_PIPELINES: usize = 500;
+
+pub(super) struct LaunchOptions {
+    pub cutoff: u64,
+    pub budget: Duration,
+}
+
+pub(super) fn launch_options(cutoff: Option<&str>, seconds: Option<&str>) -> Result<Option<LaunchOptions>, String> {
+    let Some(cutoff) = cutoff else { return Ok(None) };
+    let cutoff = cutoff.trim().parse::<u64>().ok().filter(|&n| n != 0)
+        .ok_or("XCL_PREPARE_HISTORY_PRESENT needs a positive present count")?;
+    let seconds = seconds.unwrap_or("15").trim().parse::<u64>().ok().filter(|&n| n != 0)
+        .ok_or("XCL_PREPARE_HISTORY_SECONDS needs a positive number of seconds")?;
+    Ok(Some(LaunchOptions { cutoff, budget: Duration::from_secs(seconds) }))
+}
 
 fn compute_prefix(reader: impl BufRead, cutoff: u64) -> Result<Vec<u64>, String> {
     let mut lines = reader.lines();
@@ -55,18 +70,23 @@ fn compute_prefix(reader: impl BufRead, cutoff: u64) -> Result<Vec<u64>, String>
 }
 
 fn record_indices(input: &Input, keys: &[u64]) -> Result<Vec<usize>, String> {
+    Ok(record_locations(std::slice::from_ref(input), keys)?.into_iter().map(|(_, index)| index).collect())
+}
+
+fn record_locations(inputs: &[Input], keys: &[u64]) -> Result<Vec<(usize, usize)>, String> {
     let mut wanted: HashSet<_> = keys.iter().copied().collect();
     let mut found = HashMap::new();
-    for index in 0..input.len() {
-        if wanted.is_empty() {
-            break;
+    for (input_index, input) in inputs.iter().enumerate() {
+        for index in 0..input.len() {
+            if wanted.is_empty() { break }
+            let (_, Some(blob)) = input.get(index) else { continue };
+            let key = shaders_key(std::slice::from_ref(&blob));
+            if wanted.contains(&key) && is_compute_container(&blob) {
+                found.insert(key, (input_index, index));
+                wanted.remove(&key);
+            }
         }
-        let (_, Some(blob)) = input.get(index) else { continue };
-        let key = shaders_key(std::slice::from_ref(&blob));
-        if wanted.contains(&key) && is_compute_container(&blob) {
-            found.insert(key, index);
-            wanted.remove(&key);
-        }
+        if wanted.is_empty() { break }
     }
     if !wanted.is_empty() {
         let missing: Vec<_> = keys.iter().filter(|key| wanted.contains(*key)).map(|key| format!("{key:016x}")).collect();
@@ -75,21 +95,63 @@ fn record_indices(input: &Input, keys: &[u64]) -> Result<Vec<usize>, String> {
     Ok(keys.iter().map(|key| found[key]).collect())
 }
 
-pub(super) fn run(input: &Input, manifest: &Path, cutoff: u64, windows: u32, split: Option<bool>) -> Result<(), String> {
+fn selected_records(inputs: &[Input], manifest: &Path, cutoff: u64) -> Result<Vec<(u64, usize, usize)>, String> {
     let file = std::fs::File::open(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
     let keys = compute_prefix(BufReader::new(file), cutoff)?;
-    let indices = record_indices(input, &keys)?;
-    println!("present {cutoff}: {} compute pipelines in first-use order", keys.len());
-    if keys.is_empty() {
+    let locations = record_locations(inputs, &keys)?;
+    Ok(keys.into_iter().zip(locations).map(|(key, (input, index))| (key, input, index)).collect())
+}
+
+pub(super) fn prepare_launch(
+    inputs: &[Input], manifest: &Path, options: &LaunchOptions, windows: u32,
+    adapter: &str, progress: &super::LaunchPreparation,
+) -> Result<(), String> {
+    let selected = selected_records(inputs, manifest, options.cutoff)?;
+    progress.done.store(0, Ordering::Relaxed);
+    progress.total.store(selected.len(), Ordering::Relaxed);
+    progress.workers.store(1, Ordering::Relaxed);
+    if selected.is_empty() { return Ok(()) }
+    let mut pipelines = Pipelines::for_adapter(adapter)?;
+    pipelines.warm_blobs = super::warm_blobs::Verified::for_device(&pipelines.dev);
+    let began = Instant::now();
+    for (key, input, index) in selected.iter().copied() {
+        if progress.cancel.load(Ordering::Relaxed) { return Err("Pipeline preparation cancelled".into()) }
+        if began.elapsed() >= options.budget {
+            crate::xlog_info!(
+                "History preparation: time budget ended after {} of {} compute pipelines",
+                progress.done.load(Ordering::Relaxed), selected.len()
+            );
+            break;
+        }
+        let (_, blob) = inputs[input].get(index);
+        let blob = blob.ok_or_else(|| format!("cannot reread record for {key:016x}"))?;
+        if shaders_key(std::slice::from_ref(&blob)) != key {
+            return Err(format!("record for {key:016x} changed during preparation"));
+        }
+        pipelines.prepare_compute(&blob, windows).map_err(|e| format!("compute {key:016x}: {e}"))?;
+        progress.done.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(book) = &pipelines.warm_blobs { book.save(); }
+    crate::xlog_info!(
+        "History preparation: {} of {} compute pipelines confirmed through present {} in {:.1} s",
+        progress.done.load(Ordering::Relaxed), selected.len(), options.cutoff, began.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+pub(super) fn run(input: &Input, manifest: &Path, cutoff: u64, windows: u32, split: Option<bool>) -> Result<(), String> {
+    let selected = selected_records(std::slice::from_ref(input), manifest, cutoff)?;
+    println!("present {cutoff}: {} compute pipelines in first-use order", selected.len());
+    if selected.is_empty() {
         return Ok(());
     }
     let pipelines = Pipelines::new()?;
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     recomp::dxc::set_memory_reserve(2);
-    for (key, index) in keys.iter().zip(indices) {
+    for (key, _, index) in selected {
         let (_, blob) = input.get(index);
         let blob = blob.ok_or_else(|| format!("cannot reread record for {key:016x}"))?;
-        if shaders_key(std::slice::from_ref(&blob)) != *key {
+        if shaders_key(std::slice::from_ref(&blob)) != key {
             return Err(format!("record for {key:016x} changed during precompile"));
         }
         let compiled = recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows)
@@ -149,6 +211,24 @@ mod tests {
     }
 
     #[test]
+    fn resolves_records_across_all_title_inputs() {
+        let root = std::env::temp_dir().join(format!("xcl-milestone-inputs-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = super::super::tests::compute_sample();
+        let mut second = first.clone();
+        *second.last_mut().unwrap() ^= 1;
+        let keys = [shaders_key(std::slice::from_ref(&second)), shaders_key(std::slice::from_ref(&first))];
+        let paths = [root.join("first.bin"), root.join("second.bin")];
+        std::fs::write(&paths[0], first).unwrap();
+        std::fs::write(&paths[1], second).unwrap();
+        let inputs = [Input::Files(vec![paths[0].clone()]), Input::Files(vec![paths[1].clone()])];
+        let result = record_locations(&inputs, &keys);
+        for path in paths { std::fs::remove_file(path).unwrap(); }
+        std::fs::remove_dir(root).unwrap();
+        assert_eq!(result.unwrap(), [(1, 0), (0, 0)]);
+    }
+
+    #[test]
     fn reports_all_unmatched_keys_in_first_use_order() {
         let error = record_indices(&Input::Files(vec![]), &[9, 1]).unwrap_err();
         assert!(error.contains("0000000000000009, 0000000000000001"));
@@ -162,5 +242,17 @@ mod tests {
         }
         events.push_str(&format!("{}\t0\tpresent\t1\n", MAX_PIPELINES + 1));
         assert!(compute_prefix(events.as_bytes(), 1).unwrap_err().contains("500-pipeline startup limit"));
+    }
+
+    #[test]
+    fn launch_options_are_opt_in_bounded_and_strict() {
+        assert!(launch_options(None, None).unwrap().is_none());
+        let options = launch_options(Some("64"), None).unwrap().unwrap();
+        assert_eq!(options.cutoff, 64);
+        assert_eq!(options.budget, Duration::from_secs(15));
+        assert_eq!(launch_options(Some("8"), Some("3")).unwrap().unwrap().budget, Duration::from_secs(3));
+        for (present, seconds) in [(Some("0"), None), (Some("bad"), None), (Some("1"), Some("0")), (Some("1"), Some("bad"))] {
+            assert!(launch_options(present, seconds).is_err());
+        }
     }
 }
